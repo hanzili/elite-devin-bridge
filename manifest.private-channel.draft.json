@@ -1,12 +1,35 @@
 {
-  "display_information": {"name": "Elite Devin Bridge"},
-  "features": {"bot_user": {"display_name": "Elite Devin Bridge", "always_online": false}},
-  "oauth_config": {"scopes": {"bot": ["chat:write", "groups:history",
-                                      "reactions:write", "files:read",
-                                      "files:write"]}},
-  "settings": {
-    "socket_mode_enabled": true,
-    "org_deploy_enabled": false,
-    "event_subscriptions": {"bot_events": ["message.groups"]}
+ "display_information": {
+  "name": "Elite Devin Bridge"
+ },
+ "features": {
+  "bot_user": {
+   "display_name": "Elite Devin Bridge",
+   "always_online": false
   }
+ },
+ "oauth_config": {
+  "scopes": {
+   "bot": [
+    "chat:write",
+    "groups:history",
+    "reactions:write",
+    "files:read",
+    "files:write",
+    "pins:write",
+    "pins:read",
+    "channels:read",
+    "groups:read"
+   ]
+  }
+ },
+ "settings": {
+  "socket_mode_enabled": true,
+  "org_deploy_enabled": false,
+  "event_subscriptions": {
+   "bot_events": [
+    "message.groups"
+   ]
+  }
+ }
 }

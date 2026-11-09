@@ -1843,6 +1843,168 @@ class AcpAuthTest(unittest.TestCase):
                               f"orphan error post: {t!r}")
 
 
+class InteropTest(unittest.TestCase):
+    """Cross-device interop: !sessions lists the global devin store,
+    !adopt binds a foreign session to a thread via session/load,
+    !handoff surfaces the id for `devin -r`, !release unbinds without
+    wiping context, and the pinned board renders a stable overview."""
+
+    def setUp(self):
+        import sqlite3
+        self._old_db, self._old_locks = sb.DEVIN_DB, sb.DEVIN_LOCKS
+        self.tmp = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.tmp, "sessions.db")
+        self.lock_dir = os.path.join(self.tmp, "session_locks")
+        os.makedirs(self.lock_dir)
+        self._pctx = os.environ.get("PCTX_MESSAGES_PUT")
+        os.environ["PCTX_MESSAGES_PUT"] = ""
+        db = sqlite3.connect(self.db_path)
+        db.execute("CREATE TABLE sessions(id TEXT PRIMARY KEY,"
+                   " working_directory TEXT, backend_type TEXT,"
+                   " model TEXT, agent_mode TEXT, created_at REAL,"
+                   " last_activity_at REAL, title TEXT,"
+                   " main_chain_id TEXT, shell_last_seen_index INT,"
+                   " cogs_json TEXT, workspace_dirs TEXT,"
+                   " hidden INT, metadata TEXT)")
+        proj_a = os.path.join(self.tmp, "proj-a")
+        proj_b = os.path.join(self.tmp, "proj-b")
+        proj_c = os.path.join(self.tmp, "proj-c")
+        for p in (proj_a, proj_b, proj_c):
+            os.makedirs(p)
+        for sid, wd, title, act, hid in (
+                ("desk-aa", proj_a, "桌面会话A", time.time()-600, 0),
+                ("cli-bb", proj_b, "CLI会话B", time.time()-3600, 0),
+                ("bad-id", proj_c, "坏会话", time.time()-60, 0)):
+            db.execute("INSERT INTO sessions(id,working_directory,"
+                       "title,last_activity_at,hidden) "
+                       "VALUES(?,?,?,?,?)", (sid, wd, title, act, hid))
+        db.commit(); db.close()
+        sb.DEVIN_DB = self.db_path
+        sb.DEVIN_LOCKS = self.lock_dir
+
+    def tearDown(self):
+        sb.DEVIN_DB, sb.DEVIN_LOCKS = self._old_db, self._old_locks
+        if self._pctx is None:
+            os.environ.pop("PCTX_MESSAGES_PUT", None)
+        else:
+            os.environ["PCTX_MESSAGES_PUT"] = self._pctx
+
+    def make_pins_bridge(self, **kw):
+        pinned = []
+        b, web = make_bridge(**kw)
+        b.pin_add = pinned.append
+        b.update_msg = web.update
+        return b, web, pinned
+
+    def test_sessions_list(self):
+        b, web = make_bridge()
+        b.handle_event(reply_ev("sl.1", "sl.2", "!sessions"), "EvSL")
+        self.assertTrue(web.wait_for("desk-aa", 10))
+        t = next(t for _, t in web.posts if "desk-aa" in t)
+        self.assertIn("cli-bb", t)
+        self.assertIn("!adopt", t)
+
+    def test_adopt_loads_and_continues(self):
+        b, web = make_bridge()
+        b.handle_event(reply_ev("ad.1", "ad.2", "!adopt desk-aa"),
+                       "EvAD")
+        self.assertTrue(web.wait_for("已接管", 15))
+        s = b.sessions["ad.1"]
+        self.assertEqual(s.session_id, "desk-aa")
+        self.assertTrue(s.acp_cwd.endswith("proj-a"))
+        calls = open(os.path.join(s.acp_cwd, ".acp_calls")).read()
+        self.assertIn("load:desk-aa", calls)
+        # thread reply now prompts the adopted session
+        b.handle_event(reply_ev("ad.1", "ad.3", "ping"), "EvAD3")
+        self.assertTrue(web.wait_for("✅ 完成", 15))
+        s.terminate()
+
+    def test_adopt_unknown_id(self):
+        b, web = make_bridge()
+        b.handle_event(reply_ev("au.1", "au.2", "!adopt no-such"),
+                       "EvAU")
+        self.assertTrue(web.wait_for("找不到会话", 10))
+        self.assertNotIn("au.1", b.sessions)
+
+    def test_adopt_bad_id_falls_back(self):
+        b, web = make_bridge()
+        b.handle_event(reply_ev("ab.1", "ab.2", "!adopt bad-id"),
+                       "EvAB")
+        self.assertTrue(web.wait_for("接管失败", 15))
+        self.assertNotIn("ab.1", b.sessions)
+
+    def test_adopt_locked_steals_lock(self):
+        # a live lock file means another frontend holds it; adopt must
+        # remove it so acp's session/load isn't refused outright
+        with open(os.path.join(self.lock_dir, "cli-bb.lock"), "w") as f:
+            f.write(str(os.getpid()))
+        b, web = make_bridge()
+        b.handle_event(reply_ev("al.1", "al.2", "!adopt cli-bb"), "EvAL")
+        self.assertTrue(web.wait_for("已接管", 15))
+        s = b.sessions["al.1"]
+        self.assertEqual(s.session_id, "cli-bb")
+        self.assertFalse(os.path.exists(
+            os.path.join(self.lock_dir, "cli-bb.lock")))
+        self.assertTrue(web.wait_for("抢过来", 10))
+        s.terminate()
+
+    def _wait_session(self, b, ts, timeout=10):
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            if ts in b.sessions:
+                return b.sessions[ts]
+            time.sleep(0.05)
+
+    def test_handoff_and_release(self):
+        b, web = make_bridge()
+        b.handle_event(root_ev("hr.1", "<@BTEST> ping"), "EvHR")
+        self.assertTrue(self._wait_session(b, "hr.1"))
+        web.wait_for("✅ 完成", 15)
+        sid = b.sessions["hr.1"].session_id
+        b.handle_event(reply_ev("hr.1", "hr.2", "!handoff"), "EvHR2")
+        self.assertTrue(web.wait_for(f"devin -r {sid}", 10))
+        b.handle_event(reply_ev("hr.1", "hr.3", "!release"), "EvHR3")
+        self.assertTrue(web.wait_for(f"已释放 `{sid}`", 10))
+        self.assertNotIn("hr.1", b.sessions)
+        st = sb.read_state(b._workdir("hr.1"))
+        self.assertEqual(st["session_id"], sid)
+
+    def test_board_posts_once_and_pins(self):
+        b, web, pinned = self.make_pins_bridge()
+        b.handle_event(root_ev("bd.1", "<@BTEST> ping"), "EvBD")
+        self.assertTrue(self._wait_session(b, "bd.1"))
+        web.wait_for("✅ 完成", 15)
+        b._board_refresh(manual=True)
+        board = [t for t_, t in web.posts
+                 if "Devin 会话看板" in t]
+        self.assertTrue(board)
+        top = [t_ for t_, t in web.posts if t_ is None]
+        self.assertEqual(len(top), 1)
+        self.assertEqual(pinned, [b._board_saved_ts()])
+        # second refresh updates in place, no new post
+        n_posts = len(web.posts)
+        b._board_refresh(manual=True)
+        self.assertEqual(len([t_ for t_, t in web.posts if t_ is None]),
+                         1)
+        self.assertTrue(any(u == b._board_saved_ts()
+                            for u, _ in web.updates))
+        b.sessions["bd.1"].terminate()
+
+    def test_board_touch_throttled(self):
+        b, web, pinned = self.make_pins_bridge()
+        b._board_refresh(manual=True)
+        n = len(web.posts)
+        # touch inside the gap: no immediate second refresh
+        sb.BOARD_GAP = 3600
+        try:
+            b._board_touch()
+            time.sleep(0.3)
+        finally:
+            sb.BOARD_GAP = 30
+        self.assertEqual(len(web.posts), n)
+
+
+
 class WireRobustnessTest(unittest.TestCase):
     """Agent→host requests we do not implement (elicitation/create,
     fs/*, terminal/*) must get a protocol-level refusal, not silence —

@@ -45,6 +45,16 @@ ask for permission — is handled by the bridge, not by prompting the model.
   authenticate{_meta.api_key} → session/new|load`. Key resolution:
   `DEVIN_ACP_API_KEY` → Devin Desktop active-account key
   (`state.vscdb` `windsurfAuthStatus`) → `credentials.toml`.
+- **Cross-device session interop** — all Devin sessions live in one
+  global store (`~/.local/share/devin/cli/sessions.db`), so a session
+  started anywhere resumes anywhere else: `!sessions` lists them with
+  ownership marks, `!adopt <id>` binds a Desktop/CLI session to the
+  thread via `session/load` (running in its own project dir), `!handoff`
+  surfaces the id for `devin -r` / the Desktop session list, and
+  `!release` unbinds without wiping context. A pinned channel dashboard
+  (`!board`, auto-refreshed on session lifecycle) gives a stable
+  overview — updates happen inside threads, so active sessions never
+  re-order the channel.
 - **Goal runs** — `/goal` in a thread attaches a long-running objective
   with periodic resumption (`!goal cancel` / 取消目标 to clear).
 

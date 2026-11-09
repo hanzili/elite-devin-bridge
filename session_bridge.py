@@ -177,6 +177,77 @@ def _acp_api_key():
         return ""
 
 
+# Devin CLI/Desktop's global session store: every session this machine
+# knows (interactive `devin`, Desktop tabs, and this bridge's acp
+# sessions) lives here, so it is the single inventory for cross-device
+# listing and !adopt lookups. session_locks/<id>.lock holds a PID while
+# a devin frontend keeps the session open.
+DEVIN_DB = os.path.expanduser(os.environ.get(
+    "BRIDGE_DEVIN_DB", "~/.local/share/devin/cli/sessions.db"))
+DEVIN_LOCKS = os.environ.get(
+    "BRIDGE_DEVIN_LOCKS",
+    os.path.join(os.path.dirname(DEVIN_DB), "session_locks"))
+
+
+def _devin_db():
+    import sqlite3
+    return sqlite3.connect("file:" + DEVIN_DB + "?mode=ro", uri=True)
+
+
+def list_devin_sessions(limit=15):
+    """Newest sessions across CLI/Desktop/bridge. Read-only; a missing
+    or locked store just yields an empty list."""
+    try:
+        db = _devin_db()
+        try:
+            rows = db.execute(
+                "SELECT id, working_directory, title, last_activity_at"
+                " FROM sessions WHERE hidden=0"
+                " ORDER BY last_activity_at DESC LIMIT ?", (limit,)
+            ).fetchall()
+        finally:
+            db.close()
+    except Exception:
+        return []
+    return [{"id": r[0], "workdir": r[1], "title": r[2] or "",
+             "activity": r[3] or 0,
+             "lock_pid": devin_lock_pid(r[0])} for r in rows]
+
+
+def devin_session(sid):
+    try:
+        db = _devin_db()
+        try:
+            r = db.execute(
+                "SELECT id, working_directory, title, last_activity_at"
+                " FROM sessions WHERE id=?", (sid,)).fetchone()
+        finally:
+            db.close()
+    except Exception:
+        return None
+    if not r:
+        return None
+    return {"id": r[0], "workdir": r[1], "title": r[2] or "",
+            "activity": r[3] or 0, "lock_pid": devin_lock_pid(r[0])}
+
+
+def _first_line(s, n=40):
+    lines = (s or "").splitlines()
+    return lines[0][:n] if lines else ""
+
+
+def devin_lock_pid(sid):
+    """Live PID holding <sid>'s lock file, or None (stale/absent = the
+    session is free to adopt)."""
+    try:
+        with open(os.path.join(DEVIN_LOCKS, sid + ".lock")) as f:
+            pid = int(f.read().strip())
+        os.kill(pid, 0)
+        return pid
+    except (OSError, ValueError):
+        return None
+
+
 SESSION_MODE = os.environ.get("DEVIN_SESSION_MODE", "bypass")
 AUTO_APPROVE = os.environ.get("BRIDGE_AUTO_APPROVE", "1") != "0"
 MAX_POST = int(os.environ.get("BRIDGE_MAX_POST", "12000"))
@@ -242,6 +313,11 @@ BANG_CMDS = {
     "deny": "deny", "reject": "deny", "no": "deny", "n": "deny",
     "approvals": "approvals", "perms": "approvals", "perm": "approvals",
     "reset": "reset", "new": "reset", "wipe": "reset",
+    "sessions": "sessions", "ls": "sessions", "list": "sessions",
+    "adopt": "adopt", "takeover": "adopt", "attach": "adopt",
+    "handoff": "handoff", "handover": "handoff",
+    "release": "release", "detach": "release",
+    "board": "board", "看板": "board",
 }
 # "!goal <x>" stays a session slash command except these, which the
 # bridge answers itself (goal files + RPC + markers).
@@ -254,6 +330,11 @@ HELP_CARD = """*桥命令*（`!` 开头是命令，不带 `!` 就是聊天）
 • `!allow` / `!deny` — 审批待处理请求（或直接点按钮）
 • `!approvals` — 待审批列表
 • `!reset` — 重置本线程会话，下次发言全新开始
+• `!sessions` — 列出本机所有 Devin 会话（桌面/CLI/桥，可接管状态）
+• `!adopt <会话id>` — 把一个桌面/CLI 会话接管到本线程续聊
+• `!handoff` — 显示本线程会话 id，桌面 `devin -r` 或会话列表接管
+• `!release` — 桥松开本线程会话（上下文保留，随时可再接回）
+• `!board` — 刷新频道顶部钉住的会话看板
 • `!reload` — 桥服务热重启，在跑的会话不中断
 • `!help` — 本卡片
 其它 `!命令` 原样发给会话（如 `!mode`、`!clear`）。
@@ -269,6 +350,9 @@ CRASH_RESUME_MAX = 2
 LIVE_FILE = os.path.join(TASKS_DIR, ".bridge_live.json")
 LIVE_ENV = "BRIDGE_LIVE_FILE"
 ADOPT_MAX_AGE = 6 * 3600
+# Dashboard auto-refresh throttle — a burst of session events collapses
+# into one in-place update instead of N chat_update calls.
+BOARD_GAP = int(os.environ.get("BRIDGE_BOARD_GAP", "30"))
 # A prompt whose result line sat in the reader's userspace buffer at
 # exec time is unrecoverable; give restored turns a bounded stall
 # before falling back to session/load replay.
@@ -723,16 +807,21 @@ class _InheritedProc:
 class DevinSession:
     """One persistent `devin acp` process bound to one Slack thread."""
 
-    def __init__(self, thread_ts, workdir, cmd, timeout):
+    def __init__(self, thread_ts, workdir, cmd, timeout, acp_cwd=None):
         os.makedirs(workdir, exist_ok=True)
         self.thread_ts = thread_ts
         self.workdir = workdir
+        # acp_cwd is where the agent process runs and where session/new
+        # |load anchors the session; workdir stays the bridge's own
+        # per-thread state dir. They differ when the bridge adopts a
+        # session whose home project lives elsewhere.
+        self.acp_cwd = acp_cwd or workdir
         self.timeout = timeout
         exe = shutil.which(cmd[0])
         if not exe:
             raise FileNotFoundError(f"{cmd[0]!r} 不在 PATH")
         self.proc = subprocess.Popen(
-            cmd, cwd=workdir,
+            cmd, cwd=self.acp_cwd,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, text=True, bufsize=1,
             start_new_session=True)
@@ -1172,7 +1261,7 @@ class DevinSession:
             if msg.get("id") == want_id and ("result" in msg or "error" in msg):
                 return msg
 
-    def start(self, resume_id=None):
+    def start(self, resume_id=None, strict_load=False):
         deadline = time.monotonic() + self.timeout
         i = self._request("initialize", {"protocolVersion": 1,
                                          "clientCapabilities": {}})
@@ -1197,17 +1286,21 @@ class DevinSession:
             try:
                 n = self._request("session/load",
                                   {"sessionId": resume_id,
-                                   "cwd": self.workdir,
+                                   "cwd": self.acp_cwd,
                                    "mcpServers": []})
                 res = self._wait_result(n, deadline, lambda x: None)
                 if "error" not in res:
                     self.session_id = (res.get("result") or {}).get(
                         "sessionId") or resume_id
                     self.resumed = True
+                elif strict_load:
+                    raise AcpError(res["error"])
+            except AcpError:
+                raise
             except Exception:
                 pass
         if not self.resumed:
-            n = self._request("session/new", {"cwd": self.workdir,
+            n = self._request("session/new", {"cwd": self.acp_cwd,
                                               "mcpServers": []})
             res = self._wait_result(n, deadline, lambda x: None)
             if "error" in (res or {}) and "not authenticated" in \
@@ -1397,7 +1490,8 @@ class SessionBridge:
                  timeout=TIMEOUT, idle_sec=IDLE_SEC, own_bot_id=None,
                  own_user_id=None,
                  channel=CHANNEL, react=None, unreact=None, update=None,
-                 upload=None, status=None, open_modal=None):
+                 upload=None, status=None, open_modal=None,
+                 pin_add=None, pin_list=None, pin_rm=None):
         self.post_msg = post
         self.react_msg = react
         self.unreact_msg = unreact
@@ -1405,6 +1499,11 @@ class SessionBridge:
         self.upload_msg = upload
         self.open_modal = open_modal
         self.status_msg = status
+        self.pin_add = pin_add
+        self.pin_list = pin_list
+        self.pin_rm = pin_rm
+        self._board_at = 0.0
+        self._board_lock = threading.Lock()
         self.tasks_dir = tasks_dir
         self.acp_cmd = acp_cmd
         self.timeout = timeout
@@ -1650,6 +1749,7 @@ class SessionBridge:
         self._react_state(ts, react)
         self._status_line(s, self._status_text(s, tail=text,
                                                detail=detail))
+        self._board_touch()
 
     def _draft_tick(self, ts):
         """Throttled entry: each agent_message_chunk calls this; the
@@ -2459,6 +2559,7 @@ class SessionBridge:
         s.status_ts = ack_ts
         threading.Thread(target=self._goal_watch, args=(ts, s),
                          daemon=True).start()
+        self._board_touch()
         self._run_prompt(ts, text, files)
 
     def _resume_session(self, root, text, files, session_id,
@@ -2511,6 +2612,7 @@ class SessionBridge:
                    "旧会话无法恢复（可能已被清理），已开新会话继续。")
         if not (ack_ts and self._upd(ack_ts, outcome)):
             self.post(root, outcome)
+        self._board_touch()
         self._run_prompt(root, text, files, msg_ts=msg_ts,
                          goal_replay=replayed)
 
@@ -2652,10 +2754,14 @@ class SessionBridge:
             q = f"，排队 {s.queued} 条" if s.queued else ""
             info = " · ".join(x for x in (s.model_name, s.mode_name)
                               if x)
+            sid = getattr(s, "session_id", None)
             self.post(root, f"状态: {state}，最近活动: "
                             f"{s.last_activity}（{ago} 秒前）{q}"
                             f"{self._pending_hint(root)}"
                             + (f"，{info}" if info else ""))
+            if sid:
+                self.post(root, f"会话 `{sid}`——桌面 `devin -r {sid}` "
+                                "可接管；`!handoff` 看详情。")
             if s.goal:
                 g = s.goal
                 self.post(root, f"🎯 目标: "
@@ -2753,6 +2859,16 @@ class SessionBridge:
             self._approvals(root)
         elif cmd == "reset":
             self._reset(root)
+        elif cmd == "sessions":
+            self._sessions_list(root)
+        elif cmd == "adopt":
+            self._adopt(root, arg)
+        elif cmd == "handoff":
+            self._handoff(root)
+        elif cmd == "release":
+            self._release(root)
+        elif cmd == "board":
+            self._board_refresh(manual=True, reply_to=root)
 
     def _queue_status(self, root):
         with self.lock:
@@ -2802,6 +2918,281 @@ class SessionBridge:
         write_state(wd, "reset", "", "用户重置；下条回复开新会话")
         self.post(root, "已重置：下次在本线程发言将开启全新会话"
                         "（旧上下文不保留）。")
+
+    # ---- cross-device session interop -----------------------------
+    # devin sessions are global (sessions.db): one id resumes anywhere —
+    # `devin -r <id>` on the CLI, the Desktop session list, or an ACP
+    # session/load. These commands bind/unbind that global session to a
+    # Slack thread so either side can take over the other's work.
+
+    def _sessions_list(self, root):
+        live = {s.session_id: ts for ts, s in self.sessions.items()
+                if getattr(s, "session_id", None)}
+        rows = list_devin_sessions(15)
+        if not rows:
+            self.post(root, "读不到本机 Devin 会话库（"
+                            f"{DEVIN_DB}）。")
+            return
+        now = time.time()
+        lines = ["*本机 Devin 会话*（新→旧；`!adopt <id>` 接管到本线程）"]
+        for r in rows:
+            sid = r["id"]
+            ago = int((now - r["activity"]) / 60)
+            age = f"{ago}m" if ago < 60 else f"{ago // 60}h"
+            title = _first_line(r["title"], 28)
+            if sid in live:
+                mark = "▶ 桥接管中" + ("（本线程）"
+                                       if live[sid] == root else "")
+            elif r["lock_pid"]:
+                mark = "🔒 桌面/CLI 打开中"
+            else:
+                mark = "💤 空闲"
+            lines.append(f"• `{sid}` {mark} {age}前 — {title}")
+        lines.append("桌面接管桥会话：`devin -r <id>` 或 Desktop 会话列表；"
+                     "桥会话同在此库中。")
+        self.post(root, "\n".join(lines))
+
+    def _adopt(self, root, arg):
+        sid = (arg or "").strip().split()[0] if arg else ""
+        if not sid:
+            self.post(root, "用法：`!adopt <会话id>`（`!sessions` 查看）。")
+            return
+        s = self.sessions.get(root)
+        if s and (s.running or s.queued):
+            self.post(root, "本线程会话还在执行，先 `!stop`。")
+            return
+        row = devin_session(sid)
+        if not row:
+            self.post(root, f"找不到会话 `{sid}`（`!sessions` 看可用 id）。")
+            return
+        if s and s.session_id == sid:
+            self.post(root, f"`{sid}` 已经是本线程的会话。")
+            return
+        if s:
+            s.terminate()
+            with self.lock:
+                self.sessions.pop(root, None)
+                self.stop_flags.pop(root, None)
+        self._react(root, "eyes")
+        threading.Thread(target=self._adopt_session,
+                         args=(root, row), daemon=True).start()
+
+    def _adopt_session(self, root, row):
+        sid = row["id"]
+        with self.lock:
+            if root in self.sessions or root in self.starting:
+                return
+            self.starting.add(root)
+        wd = self._workdir(root)
+        self._seed_workdir(wd, root)
+        with _file_lock:
+            try:
+                os.unlink(_state_path(wd))
+            except OSError:
+                pass
+        ack_ts = self.post(root, f"正在接管会话 `{sid}`…")
+        # A live lock means another devin frontend (Desktop tab, `devin
+        # -r`) has it open — acp refuses session/load outright. Taking
+        # over = taking the lock: removing the file lets our acp claim
+        # it. The other side keeps its stale view; whoever prompts next
+        # owns the turn, same as two `devin -r` instances racing.
+        locked = row["lock_pid"]
+        if locked:
+            try:
+                os.unlink(os.path.join(DEVIN_LOCKS, sid + ".lock"))
+            except OSError:
+                pass
+        acp_cwd = row["workdir"]
+        gone = acp_cwd and not os.path.isdir(acp_cwd)
+        s = None
+        try:
+            s = DevinSession(root, wd, self.acp_cmd, self.timeout,
+                             acp_cwd=None if gone else acp_cwd or None)
+            s.notify = lambda msg: self.post(root, msg)
+            s.on_text = lambda: self._draft_tick(root)
+            s.notify_perm = lambda summ, rid, opts: \
+                self._post_perm(root, summ, rid, opts)
+            s.perm_update = self._perm_update
+            s.start(resume_id=sid, strict_load=True)
+        except Exception as e:
+            if s is not None:
+                s.terminate()
+            write_state(wd, "failed", "", f"{type(e).__name__}: {e}",
+                        extra={"session_id": sid})
+            self._react_state(root, "x")
+            err = getattr(e, "args", [None])[0] or {}
+            if "already open" in str(err):
+                self.post(root, f"⛔ `{sid}` 还被桌面/CLI 抓着，抢锁失败。"
+                                "先去那边关掉这个会话（Desktop 关闭 tab，"
+                                "或退出 `devin -r`），再 `!adopt`。")
+            else:
+                self.post(root, f"接管失败: {type(e).__name__}: {e}")
+            with self.lock:
+                self.starting.discard(root)
+            return
+        with self.lock:
+            self.sessions[root] = s
+            self.starting.discard(root)
+        s.status_ts = ack_ts
+        threading.Thread(target=self._goal_watch, args=(root, s),
+                         daemon=True).start()
+        title = _first_line(row["title"])
+        if gone:
+            self.post(root, f"⚠️ 原目录 `{acp_cwd}` 已不存在，"
+                            "会话锚在本线程目录。")
+        if s.resumed:
+            stole = (f"（从桌面/CLI 手里抢过来的，那边还开着，"
+                     "两边别同时发）" if locked else "")
+            outcome = (f"✅ 已接管 `{sid}`（{title}）{stole}——"
+                       f"完整上下文在。项目目录 `{s.acp_cwd}`；"
+                       "直接回复继续，`!release` 交还。")
+        else:
+            outcome = (f"⚠️ `{sid}` 加载失败（可能已被清理），已在 "
+                       f"`{s.acp_cwd}` 开新会话顶替。")
+        if not (ack_ts and self._upd(ack_ts, outcome)):
+            self.post(root, outcome)
+        self._board_touch()
+
+    def _handoff(self, root):
+        """Surface this thread's session id so a human can pick the
+        same conversation up in the CLI (`devin -r`) or the Desktop
+        session list. Non-destructive: the bridge keeps the binding;
+        whoever prompts next owns the turn."""
+        s = self.sessions.get(root)
+        sid = getattr(s, "session_id", None)
+        if not sid:
+            st = read_state(self._workdir(root))
+            sid = (st or {}).get("session_id")
+        if not sid:
+            self.post(root, "本线程还没有会话可移交。")
+            return
+        row = devin_session(sid) or {}
+        title = _first_line(row.get("title"))
+        lines = [f"会话 `{sid}`"
+                 + (f"（{title}）" if title else "")]
+        lines.append("它在本机全局会话库，Desktop 会话列表里能直接看到。")
+        if root in self.sessions:
+            lines.append("桥的 acp 正持有它的锁——先发 `!release` 松手，"
+                         f"再 `devin -r {sid}` 或 Desktop 里打开。")
+        else:
+            lines.append(f"桌面 `devin -r {sid}` 直接接管；"
+                         "本线程 `!adopt` 也能接回。")
+        self.post(root, "\n".join(lines))
+
+    def _release(self, root):
+        """Drop the bridge's process+binding without wiping context:
+        the global session stays in the store, resumable via Desktop,
+        `devin -r`, or a later `!adopt`."""
+        s = self.sessions.get(root)
+        sid = getattr(s, "session_id", None) if s else None
+        if s and (s.running or s.queued):
+            self.post(root, "会话还在执行，先 `!stop` 再 `!release`。")
+            return
+        if not s:
+            self.post(root, "本线程没有桥接会话可释放。")
+            return
+        s.terminate()
+        with self.lock:
+            self.sessions.pop(root, None)
+            self.stop_flags.pop(root, None)
+        write_state(self._workdir(root), "released", "",
+                    f"会话 {sid or '?'} 已释放，可在桌面接管",
+                    extra={"session_id": sid})
+        self._react_state(root, "hand")
+        self.post(root, f"已释放 `{sid}`——上下文保留在本机会话库。"
+                        f"桌面 `devin -r {sid}` 接管；本线程再发消息"
+                        "或 `!adopt` 也能接回来。")
+        self._board_touch()
+
+    # ---- pinned channel dashboard ---------------------------------
+    # One top-level message, pinned, updated in place. Active sessions
+    # live inside threads so nothing re-orders the channel; this board
+    # is the stable overview the user asked for instead of sessions
+    # popping to the top on every update.
+
+    def _board_path(self):
+        return os.path.join(self.tasks_dir, ".bridge_board.json")
+
+    def _board_saved_ts(self):
+        try:
+            with open(self._board_path()) as f:
+                return (json.load(f) or {}).get("ts")
+        except (OSError, ValueError):
+            return None
+
+    def _board_save_ts(self, ts):
+        try:
+            os.makedirs(self.tasks_dir, exist_ok=True)
+            with open(self._board_path(), "w") as f:
+                json.dump({"ts": ts}, f)
+        except OSError:
+            pass
+
+    def _board_render(self):
+        now = time.time()
+        live = []
+        for ts, s in self.sessions.items():
+            sid = getattr(s, "session_id", None)
+            if not sid:
+                continue
+            row = devin_session(sid) or {}
+            title = _first_line(row.get("title"), 26)
+            state = "▶ 执行中" if s.running else "💤 空闲"
+            live.append((s.last_activity_at, sid, title, state, ts))
+        live.sort(reverse=True)
+        lines = ["📋 *Devin 会话看板* · 更新于 "
+                 + time.strftime("%m-%d %H:%M")]
+        if live:
+            lines.append("*桥接管中*（线程内续聊；`!release` 交还）")
+            for _, sid, title, state, ts in live[:8]:
+                lines.append(f"• `{sid}` {state} — {title}")
+        bound = {sid for _, sid, _, _, _ in live}
+        rows = [r for r in list_devin_sessions(10)
+                if r["id"] not in bound]
+        if rows:
+            lines.append("*本机会话*（`!adopt <id>` 接管；桌面 `devin -r` "
+                         "直达）")
+            for r in rows[:8]:
+                ago = int((now - r["activity"]) / 60)
+                age = f"{ago}m" if ago < 60 else f"{ago // 60}h"
+                mark = "🔒" if r["lock_pid"] else "💤"
+                title = _first_line(r["title"], 26)
+                lines.append(f"• `{r['id']}` {mark} {age}前 — {title}")
+        if not live and not rows:
+            lines.append("暂无会话。")
+        lines.append("_💤空闲 · 🔒桌面/CLI 打开中 · "
+                     "线程内 !sessions 看全表_")
+        return "\n".join(lines)
+
+    def _board_touch(self):
+        """Cheap trigger after session lifecycle events; real refresh
+        is throttled so bursts of activity don't spam chat.update."""
+        if self.pin_add is None:
+            return
+        if time.monotonic() - self._board_at < BOARD_GAP:
+            return
+        threading.Thread(target=self._board_refresh,
+                         daemon=True).start()
+
+    def _board_refresh(self, manual=False, reply_to=None):
+        with self._board_lock:
+            self._board_at = time.monotonic()
+            text = self._board_render()
+            ts = self._board_saved_ts()
+            updated = bool(ts and self.update_msg
+                           and self._upd(ts, text))
+            if not updated:
+                ts = self.post(None, text)
+                if ts:
+                    self._board_save_ts(ts)
+                    if self.pin_add:
+                        try:
+                            self.pin_add(ts)
+                        except Exception as e:
+                            if _slack_err(e) != "already_pinned":
+                                self._log_err("pin_add", e)
+        if reply_to:
+            self.post(reply_to, "看板已刷新（频道置顶那条 📋）。")
 
     def handle_interaction(self, payload):
         """Slack interactive payloads: permission option buttons, the
@@ -3198,9 +3589,10 @@ def main():
     own_user_id = auth.get("user_id")
 
     def post(ts, text, blocks=None):
-        return web.chat_postMessage(
-            channel=CHANNEL, thread_ts=ts, text=text,
-            blocks=blocks).get("ts")
+        kw = {"channel": CHANNEL, "text": text, "blocks": blocks}
+        if ts is not None:
+            kw["thread_ts"] = ts
+        return web.chat_postMessage(**kw).get("ts")
 
     def react(ts, name):
         web.reactions_add(channel=CHANNEL, timestamp=ts, name=name)
@@ -3225,11 +3617,22 @@ def main():
     def open_modal(trigger_id, view):
         web.views_open(trigger_id=trigger_id, view=view)
 
+    def pin_add(ts):
+        web.pins_add(channel=CHANNEL, timestamp=ts)
+
+    def pin_list():
+        return web.pins_list(channel=CHANNEL).get("items") or []
+
+    def pin_rm(ts):
+        web.pins_remove(channel=CHANNEL, timestamp=ts)
+
     bridge = SessionBridge(post, own_bot_id=own_bot_id,
                            own_user_id=own_user_id,
                            react=react, unreact=unreact, update=update,
                            upload=upload, status=set_status,
-                           open_modal=open_modal)
+                           open_modal=open_modal,
+                           pin_add=pin_add, pin_list=pin_list,
+                           pin_rm=pin_rm)
     signal.signal(signal.SIGHUP,
                   lambda *a: bridge.reload_ev.set())
     signal.signal(signal.SIGTERM,

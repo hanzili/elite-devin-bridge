@@ -250,7 +250,17 @@ def main():
                                        "name": "SWE-2"}]}]}})
         elif method == "session/load":
             sid = (msg.get("params") or {}).get("sessionId")
-            if sid == "bad-id":
+            try:
+                with open(".acp_calls", "a") as f:
+                    f.write(f"load:{sid}\n")
+            except OSError:
+                pass
+            if os.environ.get("FAKE_REQUIRE_AUTH") and not authed[0]:
+                send({"jsonrpc": "2.0", "id": mid,
+                      "error": {"code": -32000,
+                                "message": "ACP host has not "
+                                "authenticated."}})
+            elif sid == "bad-id":
                 send({"jsonrpc": "2.0", "id": mid,
                       "error": {"code": -32602,
                                 "message": "unknown session"}})
