@@ -16,10 +16,8 @@
     "reactions:write",
     "files:read",
     "files:write",
-    "pins:write",
     "pins:read",
-    "channels:read",
-    "groups:read"
+    "pins:write"
    ]
   }
  },
