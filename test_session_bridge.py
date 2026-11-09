@@ -1874,7 +1874,7 @@ class InteropTest(unittest.TestCase):
         for sid, wd, title, act, hid in (
                 ("desk-aa", proj_a, "桌面会话A", time.time()-600, 0),
                 ("cli-bb", proj_b, "CLI会话B", time.time()-3600, 0),
-                ("bad-id", proj_c, "坏会话", time.time()-60, 0)):
+                ("bad-id", proj_c, "坏会话", time.time()-7200, 0)):
             db.execute("INSERT INTO sessions(id,working_directory,"
                        "title,last_activity_at,hidden) "
                        "VALUES(?,?,?,?,?)", (sid, wd, title, act, hid))
@@ -1918,6 +1918,13 @@ class InteropTest(unittest.TestCase):
         b.handle_event(reply_ev("ad.1", "ad.3", "ping"), "EvAD3")
         self.assertTrue(web.wait_for("✅ 完成", 15))
         s.terminate()
+
+    def test_adopt_bare_picks_newest_unbound(self):
+        b, web = make_bridge()
+        b.handle_event(reply_ev("an.1", "an.2", "!adopt"), "EvAN")
+        # desk-aa is the newest row in the fake store
+        self.assertTrue(web.wait_for("已接管 `desk-aa`", 15))
+        b.sessions["an.1"].terminate()
 
     def test_adopt_unknown_id(self):
         b, web = make_bridge()

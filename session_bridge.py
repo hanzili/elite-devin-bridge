@@ -331,7 +331,7 @@ HELP_CARD = """*桥命令*（`!` 开头是命令，不带 `!` 就是聊天）
 • `!approvals` — 待审批列表
 • `!reset` — 重置本线程会话，下次发言全新开始
 • `!sessions` — 列出本机所有 Devin 会话（桌面/CLI/桥，可接管状态）
-• `!adopt <会话id>` — 把一个桌面/CLI 会话接管到本线程续聊
+• `!adopt [会话id]` — 接管桌面/CLI 会话到本线程；不带 id 接管最近一个
 • `!handoff` — 显示本线程会话 id，桌面 `devin -r` 或会话列表接管
 • `!release` — 桥松开本线程会话（上下文保留，随时可再接回）
 • `!board` — 刷新频道顶部钉住的会话看板
@@ -2955,15 +2955,33 @@ class SessionBridge:
     def _adopt(self, root, arg):
         sid = (arg or "").strip().split()[0] if arg else ""
         if not sid:
-            self.post(root, "用法：`!adopt <会话id>`（`!sessions` 查看）。")
-            return
+            # Mobile-friendly: bare `!adopt` grabs the most recent
+            # UNLOCKED session not already bound to a thread. Stealing a
+            # live lock needs the explicit `!adopt <id>` form — the
+            # newest session is very often the one the user is still
+            # typing into somewhere else.
+            bound = {getattr(s, "session_id", None)
+                     for s in self.sessions.values()}
+            rows = [r for r in list_devin_sessions(15)
+                    if r["id"] not in bound]
+            cand = next((r for r in rows if not r["lock_pid"]), None)
+            if not cand:
+                hint = (f"最近的会话都被占着（🔒）：点名接管 "
+                        f"`!adopt {rows[0]['id']}`" if rows else
+                        "没有可接管的会话")
+                self.post(root, hint + "（`!sessions` 看全表）。")
+                return
+            row = cand
+            sid = row["id"]
+        else:
+            row = devin_session(sid)
+            if not row:
+                self.post(root, f"找不到会话 `{sid}`"
+                                "（`!sessions` 看可用 id）。")
+                return
         s = self.sessions.get(root)
         if s and (s.running or s.queued):
             self.post(root, "本线程会话还在执行，先 `!stop`。")
-            return
-        row = devin_session(sid)
-        if not row:
-            self.post(root, f"找不到会话 `{sid}`（`!sessions` 看可用 id）。")
             return
         if s and s.session_id == sid:
             self.post(root, f"`{sid}` 已经是本线程的会话。")
