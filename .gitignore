@@ -1,0 +1,21 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# local ops artifacts (not part of the public source)
+.switch-log
+.switch-result
+decisions.tsv
+
+# internal review notes
+DEPLOYMENT_GATES.md
+REQUIREMENTS_REVIEW.md
+ADAPTER_REVIEW.md
+SESSIONS_HANDOFF.md
+
+# local env / credentials — never commit
+.env
+*.env
+env
+credentials.toml

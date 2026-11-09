@@ -1,0 +1,32 @@
+# systemd user unit — NOT installed/enabled by default.
+# Install:  cp session-bridge.service ~/.config/systemd/user/
+#           systemctl --user daemon-reload
+# Switch:   systemctl --user stop smoke-echo && systemctl --user enable --now session-bridge
+# Revert:   systemctl --user stop session-bridge && systemctl --user start smoke-echo
+# WARNING: stopping smoke-echo kills every live thread session under it.
+[Unit]
+Description=Slack session bridge (devin acp, reliable)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/devin-bridge/env
+WorkingDirectory=%h/elite-devin-bridge
+ExecStart=%h/elite-devin-bridge/.venv/bin/python %h/elite-devin-bridge/session_bridge.py
+# SIGTERM parks every acp pipe in the fd store below, so 'restart'
+# carries live sessions into the replacement process. 'reload' sends
+# SIGHUP: the bridge re-execs itself in place and keeps everything.
+# KillMode=process keeps systemd from signalling acp children itself.
+NotifyAccess=main
+FileDescriptorStoreMax=64
+KillMode=process
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=5
+StartLimitBurst=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

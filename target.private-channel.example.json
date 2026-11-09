@@ -1,0 +1,26 @@
+{
+  "kind": "offline-plan-not-runtime-config",
+  "workspace_name": "your-workspace",
+  "team_id": "T00000000",
+  "channel_name": "devin-tasks",
+  "channel_visibility": "private",
+  "channel_id": null,
+  "owner_display_name": "Owner",
+  "owner_user_id": null,
+  "dot_user_id": "U00000000",
+  "dot_bot_id": "B00000000",
+  "dot_app_id": null,
+  "worker_user_id": null,
+  "worker_bot_id": null,
+  "receiver_app_id": null,
+  "workspace_aliases": [],
+  "approved_workspace_paths": {},
+  "launch_enabled": false,
+  "workspace_trust_changed": false,
+  "source_share_approved": false,
+  "reported_slack_setup": {
+    "app_installed": true,
+    "socket_token_generated": true,
+    "socket_token_saved": false
+  }
+}

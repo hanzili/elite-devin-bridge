@@ -1,0 +1,25 @@
+# systemd user unit — install to ~/.config/systemd/user/smoke-echo.service
+# Commands (user-level, no sudo):
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now smoke-echo      # start now + auto-start on login
+#   loginctl enable-linger hanzi                  # keep running after logout (one-time)
+#   journalctl --user -u smoke-echo -f            # logs (no tokens are printed)
+#   systemctl --user stop smoke-echo              # stop
+[Unit]
+Description=Slack smoke echo bridge (devin acp)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/devin-bridge/env
+WorkingDirectory=%h/elite-devin-bridge
+ExecStart=%h/elite-devin-bridge/.venv/bin/python %h/elite-devin-bridge/smoke_sessions.py
+Restart=always
+RestartSec=5
+StartLimitBurst=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
