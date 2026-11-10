@@ -218,11 +218,15 @@ class Governor:
             return dict(e) if e else None
 
     def due(self, now=None):
-        """Parked entries whose cooldown has elapsed, earliest first."""
+        """Parked entries whose cooldown has elapsed, earliest first.
+        'suspect' entries are watch-only (their session is still locked
+        by a live frontend); the scan loop promotes them to resumable
+        when the lock dies — due() never dispatches them directly."""
         now = time.time() if now is None else now
         with self.lock:
             ready = [(k, dict(e)) for k, e in self.entries.items()
-                     if e.get("resume_at", 0) <= now]
+                     if not e.get("suspect")
+                     and e.get("resume_at", 0) <= now]
         ready.sort(key=lambda kv: kv[1].get("resume_at", 0))
         return ready
 

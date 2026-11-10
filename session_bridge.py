@@ -83,6 +83,7 @@ Opt: DEVIN_TASKS_DIR (~/devin-tasks), SESSION_IDLE_SEC (3600),
      cap EXT_MAX=6). History: .bridge_limits.log, `!limits` in Slack.
 """
 import array
+import hashlib
 import json
 import math
 import os
@@ -156,6 +157,16 @@ ACP_CREDENTIALS = os.environ.get(
 ACP_DESKTOP_STATE = os.environ.get(
     "DEVIN_ACP_DESKTOP_STATE",
     "~/.config/Devin/User/globalStorage/state.vscdb")
+
+
+def _acct_fingerprint():
+    """Short fingerprint of the credential the bridge would use right
+    now. Limits are per-account; the user rotates accounts on Desktop,
+    which the bridge follows — a fingerprint change means every parked
+    turn is worth retrying early (the parked reset window belonged to
+    the previous account's quota)."""
+    key = _acp_api_key()
+    return hashlib.sha256(key.encode()).hexdigest()[:12] if key else ""
 
 
 def _acp_api_key():
@@ -294,10 +305,10 @@ GOAL_STATUS_CN = {"running": "进行中", "paused": "已暂停",
 # seconds so a batch doesn't re-trip the cap in lockstep. The same
 # watcher scans the shared devin session store for Desktop/CLI sessions
 # whose transcript tail shows they stalled on the limit; those are
-# resumed via session/load + a nudge prompt (their session lock is
-# taken over when BRIDGE_LIMIT_EXT_STEAL=1, since a dead turn can't be
-# retried by the other frontend anyway). History lands in
-# .bridge_limits.log (JSONL).
+# resumed via session/load + a nudge prompt once no live process owns
+# the session; sessions still locked by a live frontend are tracked as
+# 'suspects' (visible in !limits) and only taken over when
+# BRIDGE_LIMIT_EXT_STEAL=1. History lands in .bridge_limits.log (JSONL).
 LIMIT_RESUME_MAX = int(os.environ.get("BRIDGE_LIMIT_RESUME_MAX", "8"))
 LIMIT_BASE_BACKOFF = float(os.environ.get("BRIDGE_LIMIT_BACKOFF", "30"))
 LIMIT_BACKOFF_CAP = float(os.environ.get("BRIDGE_LIMIT_BACKOFF_CAP",
@@ -308,12 +319,20 @@ LIMIT_SWEEP_SEC = float(os.environ.get("BRIDGE_LIMIT_SWEEP_SEC", "15"))
 LIMIT_ADOPT_AGE = float(os.environ.get("BRIDGE_LIMIT_ADOPT_AGE",
                                        "21600"))
 LIMIT_EXT = os.environ.get("BRIDGE_LIMIT_EXTERNAL", "1") != "0"
-LIMIT_EXT_STEAL = os.environ.get("BRIDGE_LIMIT_EXT_STEAL", "1") != "0"
+# Off by default: unlinking a lock a LIVE frontend still holds lets a
+# second driver into a session that frontend believes it owns. Enable
+# only when the dead-turn victims matter more than that race.
+LIMIT_EXT_STEAL = os.environ.get("BRIDGE_LIMIT_EXT_STEAL", "0") != "0"
 LIMIT_EXT_WINDOW = float(os.environ.get("BRIDGE_LIMIT_EXT_WINDOW",
                                         "3600"))
 LIMIT_EXT_SCAN = float(os.environ.get("BRIDGE_LIMIT_EXT_SCAN_SEC", "90"))
 LIMIT_EXT_MAX = int(os.environ.get("BRIDGE_LIMIT_EXT_MAX", "6"))
 LIMIT_EXT_POST = os.environ.get("BRIDGE_LIMIT_EXT_POST", "1") != "0"
+# A mid-turn tail is only 'dead' when its newest node is this stale —
+# long-running tool calls and thinking steps can silence a live turn
+# for minutes, so locked sessions need real staleness before we even
+# watch them, let alone take them over.
+LIMIT_EXT_FRESH = float(os.environ.get("BRIDGE_LIMIT_EXT_FRESH", "600"))
 EXT_RESUME_PROMPT = os.environ.get(
     "BRIDGE_LIMIT_EXT_PROMPT",
     "（自动恢复：服务端限额冷却已结束）请继续完成刚才被中断的工作；"
@@ -1584,6 +1603,7 @@ class SessionBridge:
             tasks_dir, printer=lambda m: print(m, flush=True))
         self.limit_attempts = {}
         self._ext_scan_at = 0.0
+        self._acct = _acct_fingerprint()
 
     def _log_err(self, label, e):
         err = _slack_err(e)
@@ -2342,7 +2362,7 @@ class SessionBridge:
             "session_id": getattr(s, "session_id", None),
             "error": info["message"][:300], "error_kind": info["kind"],
             "reset_at": reset_at, "resume_at": resume_at,
-            "attempt": attempt,
+            "attempt": attempt, "acct": _acct_fingerprint(),
             "live_sessions": live, "active_turns": active})
         write_state(s.workdir, "rate_limited", s.last_activity,
                     f"{info['kind']}，{wait_for}自动重试"
@@ -2362,6 +2382,7 @@ class SessionBridge:
         store for Desktop/CLI sessions the same limit took out."""
         while True:
             try:
+                self._acct_drift_check()
                 self._limit_sweep()
                 if LIMIT_EXT and time.monotonic() - self._ext_scan_at \
                         > LIMIT_EXT_SCAN:
@@ -2370,6 +2391,26 @@ class SessionBridge:
             except Exception as e:
                 self._log_err("limit sweep", e)
             time.sleep(LIMIT_SWEEP_SEC)
+
+    def _acct_drift_check(self):
+        """The user rotates Devin accounts on Desktop; the bridge
+        follows that credential. A fingerprint change means the quota
+        behind every parked turn is fresh — pull every queued resume
+        forward instead of waiting out the old account's window."""
+        acct = _acct_fingerprint()
+        if not acct or acct == self._acct:
+            return
+        self.governor.event("acct_switch", prev=self._acct, acct=acct)
+        self._acct = acct
+        for e in self.governor.snapshot():
+            key = e.get("key")
+            if not key or e.get("suspect"):
+                continue
+            e2 = dict(e)
+            e2.pop("key", None)
+            e2["acct"] = acct
+            e2["resume_at"] = time.time() + random.uniform(3, 15)
+            self.governor.park(key, e2)
 
     def _limit_sweep(self):
         now = time.time()
@@ -2427,22 +2468,28 @@ class SessionBridge:
         return owned
 
     def _ext_tail_verdict(self, sid, tail=6):
-        """-> (verdict, reset_at|None): the session's last transcript
-        nodes say 'limited' (a rate-limit error sits in the tail),
-        'midturn' (turn cut mid-flight), or 'idle'."""
+        """-> (verdict, reset_at|None, newest_node_ts|None): the
+        session's last transcript nodes say 'limited' (a rate-limit
+        error sits in the tail), 'midturn' (turn cut mid-flight), or
+        'idle'. newest_node_ts is the created_at of the freshest node —
+        the liveness signal: a live turn writes nodes continuously, a
+        dead turn's newest node stays stale."""
         try:
             db = _devin_db()
             try:
                 rows = db.execute(
-                    "SELECT chat_message FROM message_nodes"
+                    "SELECT chat_message, created_at FROM message_nodes"
                     " WHERE session_id=? ORDER BY node_id DESC LIMIT ?",
                     (sid, tail)).fetchall()
             finally:
                 db.close()
         except Exception:
-            return "idle", None
+            return "idle", None, None
         nodes = []
-        for (cm,) in rows:
+        newest = None
+        for cm, ts in rows:
+            if newest is None and ts:
+                newest = ts
             try:
                 nodes.append(json.loads(cm))
             except ValueError:
@@ -2455,16 +2502,47 @@ class SessionBridge:
                 if limit_governor.TOOL_LIMIT_RE.match(c):
                     reset = limit_governor.parse_reset(c)
                     break
-        return verdict, reset
+        return verdict, reset, newest
 
     def _ext_scan(self):
-        """Park external sessions the limit took out: transcript tail
-        shows a rate-limit node, or the tail ends mid-turn while a
-        limit window is open (a bridge turn just hit one)."""
+        """Park external sessions the limit took out.
+
+        A transcript tail showing a limit error, or one that ends
+        mid-turn, marks a victim. Sessions no live process owns
+        (stale/absent lock) park for auto-resume — nothing else can be
+        running them. Sessions a live frontend still locks become
+        'suspects': tracked in !limits, promoted to resumable when the
+        lock dies (or right away with EXT_STEAL). Mid-turn tails only
+        count as suspects while a limit window is open — a healthy
+        busy session looks identical otherwise."""
         now = time.time()
         owned = self._bridge_session_ids()
-        window_open = now - self.governor.last_limit_at \
-            < LIMIT_EXT_WINDOW
+        for e in self.governor.snapshot():
+            key = e.get("key") or ""
+            sid = e.get("session_id")
+            if not key.startswith("ext:") or not sid:
+                continue
+            row = devin_session(sid)
+            if not row:
+                self.governor.pop(key, "gone")
+                continue
+            if row["activity"] > e.get("first_hit", 0):
+                self.governor.pop(key, "superseded")
+            elif not e.get("suspect"):
+                continue
+            elif not row["lock_pid"] or (
+                    LIMIT_EXT_STEAL and (
+                        e.get("verdict") == "limited"
+                        or now - self.governor.last_limit_at
+                        < LIMIT_EXT_WINDOW)):
+                e2 = dict(e)
+                e2.pop("key", None)
+                e2.pop("suspect", None)
+                e2["resume_at"] = now + random.uniform(5, 25)
+                self.governor.park(key, e2)
+                self.governor.event("suspect_promoted", session=sid)
+            elif now - e.get("first_hit", now) > LIMIT_EXT_WINDOW:
+                self.governor.pop(key, "expired")
         parked_new = 0
         for row in list_devin_sessions(limit=60):
             sid = row["id"]
@@ -2472,14 +2550,48 @@ class SessionBridge:
                     or self.governor.get("ext:" + sid) \
                     or now - row["activity"] > LIMIT_EXT_WINDOW:
                 continue
-            verdict, reset = self._ext_tail_verdict(sid)
-            if verdict != "limited" and not (
-                    verdict == "midturn" and window_open):
+            verdict, reset, node_ts = self._ext_tail_verdict(sid)
+            if verdict not in ("limited", "midturn"):
+                continue
+            locked = bool(row["lock_pid"])
+            # Fresh nodes = someone is still writing; a live turn can
+            # even carry an absorbed limit error mid-tail. Only stale
+            # tails count as dead on locked sessions. An unlocked
+            # session showing a limit error just died — no driver can
+            # exist without the lock.
+            stale = node_ts is not None \
+                and now - node_ts > LIMIT_EXT_FRESH
+            if not stale and (verdict != "limited" or locked):
+                continue
+            suspect = False
+            if locked:
+                # Stealing a live lock only gets justified by hard
+                # evidence: a limit error in the tail, or a stale
+                # mid-turn during an open limit window. A stale locked
+                # mid-turn otherwise is ambiguous (dead turn vs >10min
+                # silent tool call) — watch it as a suspect either way.
+                window_open = now - self.governor.last_limit_at \
+                    < LIMIT_EXT_WINDOW
+                if not LIMIT_EXT_STEAL or (
+                        verdict == "midturn" and not window_open):
+                    suspect = True
+            if suspect:
+                self.governor.park("ext:" + sid, {
+                    "kind": "external", "session_id": sid,
+                    "workdir": row["workdir"],
+                    "title": row.get("title") or "",
+                    "error_kind": "rate_limited", "suspect": True,
+                    "verdict": verdict,
+                    "reset_at": reset, "acct": self._acct,
+                    "resume_at": now + LIMIT_EXT_WINDOW})
+                self.governor.event("external_suspect", session=sid,
+                                    pid=row["lock_pid"],
+                                    verdict=verdict)
                 continue
             entry = {"kind": "external", "session_id": sid,
                      "workdir": row["workdir"],
                      "title": row.get("title") or "",
-                     "error_kind": "rate_limited",
+                     "error_kind": "rate_limited", "acct": self._acct,
                      "reset_at": reset,
                      "resume_at": (reset + random.uniform(2, 12))
                      if reset else now + limit_governor.backoff(
@@ -2501,13 +2613,21 @@ class SessionBridge:
             return
         pid = devin_lock_pid(sid)
         if pid and not LIMIT_EXT_STEAL:
-            self.governor.event("external_locked", session=sid, pid=pid)
             e = dict(entry)
             e.pop("attempt", None)
-            e["resume_at"] = time.time() + 300
+            e["suspect"] = True
+            e["resume_at"] = time.time() + LIMIT_EXT_WINDOW
             self.governor.park("ext:" + sid, e)
+            self.governor.event("external_locked", session=sid, pid=pid)
             return
         if pid:
+            verdict, _r, nts = self._ext_tail_verdict(sid)
+            if verdict == "idle" or (
+                    verdict == "midturn" and nts is not None
+                    and time.time() - nts < LIMIT_EXT_FRESH):
+                self.governor.event("external_revived", session=sid,
+                                    pid=pid, verdict=verdict)
+                return
             try:
                 os.unlink(os.path.join(DEVIN_LOCKS, sid + ".lock"))
                 self.governor.event("external_lock_steal",
@@ -2585,7 +2705,7 @@ class SessionBridge:
                 "kind": "bridge", "text": RESUME_NUDGE,
                 "session_id": st["session_id"],
                 "error": (detail or "resumed_after_restart")[:300],
-                "error_kind": "rate_limited",
+                "error_kind": "rate_limited", "acct": self._acct,
                 "resume_at": now + random.uniform(10, 40)})
             adopted.append(ts)
             self._react_state(ts, REACT_LIMITED)
@@ -2611,12 +2731,16 @@ class SessionBridge:
                     who = "本线程"
                 else:
                     who = f"线程 {e['key']}"
-                wait = int(e.get("resume_at", 0) - now)
+                if e.get("suspect"):
+                    when = ("前端仍占锁，仅观察（steal=1 可接管）"
+                            if not LIMIT_EXT_STEAL else "等待接管")
+                else:
+                    wait = int(e.get("resume_at", 0) - now)
+                    when = f"{wait}s 后重试" if wait > 0 else "待调度"
                 lines.append(
                     f"• {who} `{e.get('session_id') or '?'}` "
                     f"{e.get('error_kind')} · 第 "
-                    f"{e.get('attempt', '?')} 次 · "
-                    + (f"{wait}s 后重试" if wait > 0 else "待调度"))
+                    f"{e.get('attempt', '?')} 次 · {when}")
         else:
             lines.append("冷却队列是空的。")
         evs = self.governor.events_tail(8)

@@ -228,5 +228,193 @@ class BridgeLimitTest(unittest.TestCase):
         self.assertIsNone(b.governor.get("1801.1"))
 
 
+class SuspectDueTest(unittest.TestCase):
+    def test_due_never_dispatches_suspects(self):
+        g = lg.Governor(tempfile.mkdtemp())
+        g.park("ext:s", {"kind": "external", "session_id": "s",
+                         "suspect": True,
+                         "resume_at": time.time() - 1})
+        self.assertEqual(g.due(), [])
+
+
+class ExternalScanTest(unittest.TestCase):
+    """_ext_scan gating: unlocked victims park for auto-resume,
+    live-locked ones degrade to watch-only 'suspects'."""
+
+    def setUp(self):
+        self.b, self.web = tsb.make_bridge()
+        self._list = sb.list_devin_sessions
+        self._sess = sb.devin_session
+        self._lock = sb.devin_lock_pid
+        self._steal = sb.LIMIT_EXT_STEAL
+        sb.LIMIT_EXT_STEAL = False
+        self.rows = []
+        sb.list_devin_sessions = lambda limit=15: self.rows
+        sb.devin_session = lambda sid: next(
+            (r for r in self.rows if r["id"] == sid), None)
+        sb.devin_lock_pid = lambda sid: next(
+            (r["lock_pid"] for r in self.rows if r["id"] == sid),
+            None)
+
+    def tearDown(self):
+        sb.list_devin_sessions = self._list
+        sb.devin_session = self._sess
+        sb.devin_lock_pid = self._lock
+        sb.LIMIT_EXT_STEAL = self._steal
+
+    def _row(self, sid, age=60, lock=None):
+        return {"id": sid, "workdir": "/tmp/wd-" + sid,
+                "title": "task " + sid,
+                "activity": time.time() - age, "lock_pid": lock}
+
+    def _verdict(self, mapping, fresh=False):
+        node_ts = time.time() if fresh else time.time() - 3600
+        self.b._ext_tail_verdict = lambda sid, tail=6: \
+            mapping.get(sid, ("idle", None, None))[:2] + (node_ts,) \
+            if sid in mapping else ("idle", None, None)
+
+    def test_unlocked_limited_parks(self):
+        self.rows = [self._row("s-ext")]
+        self._verdict({"s-ext": ("limited", time.time() + 30)})
+        self.b._ext_scan()
+        e = self.b.governor.get("ext:s-ext")
+        self.assertIsNotNone(e)
+        self.assertFalse(e.get("suspect"))
+        self.assertGreater(e["resume_at"], time.time())
+
+    def test_locked_limited_is_suspect(self):
+        self.rows = [self._row("s-lock", lock=4321)]
+        self._verdict({"s-lock": ("limited", time.time() + 30)})
+        self.b._ext_scan()
+        e = self.b.governor.get("ext:s-lock")
+        self.assertIsNotNone(e)
+        self.assertTrue(e.get("suspect"))
+        self.assertEqual(self.b.governor.due(), [])
+
+    def test_suspect_promotes_when_lock_dies(self):
+        self.rows = [self._row("s-lock", lock=4321)]
+        self._verdict({"s-lock": ("limited", None)})
+        self.b._ext_scan()
+        self.rows[0]["lock_pid"] = None
+        self.b._ext_scan()
+        e = self.b.governor.get("ext:s-lock")
+        self.assertIsNotNone(e)
+        self.assertFalse(e.get("suspect"))
+        self.assertLess(e["resume_at"], time.time() + 30)
+
+    def test_unlocked_midturn_parks_without_window(self):
+        # A mid-turn tail on a session nobody owns is an orphan —
+        # rescuable even without an open limit window.
+        self.rows = [self._row("s-dead")]
+        self._verdict({"s-dead": ("midturn", None)})
+        self.b._ext_scan()
+        self.assertIsNotNone(self.b.governor.get("ext:s-dead"))
+
+    def test_locked_stale_midturn_suspects_without_window(self):
+        # Ambiguous: dead turn or a >10min silent tool call — watch it,
+        # never auto-steal unless a limit window is actually open.
+        self.rows = [self._row("s-live", lock=777)]
+        self._verdict({"s-live": ("midturn", None)})
+        self.b._ext_scan()
+        e = self.b.governor.get("ext:s-live")
+        self.assertIsNotNone(e)
+        self.assertTrue(e.get("suspect"))
+
+    def test_steal_midturn_only_inside_window(self):
+        sb.LIMIT_EXT_STEAL = True
+        self.rows = [self._row("s-live", lock=777)]
+        self._verdict({"s-live": ("midturn", None)})
+        self.b._ext_scan()
+        self.assertTrue(self.b.governor.get("ext:s-live")["suspect"])
+        self.b.governor.pop("ext:s-live", "test")
+        self.b.governor.last_limit_at = time.time()
+        self.b._ext_scan()
+        e = self.b.governor.get("ext:s-live")
+        self.assertIsNotNone(e)
+        self.assertFalse(e.get("suspect"))
+
+    def test_suspect_superseded_when_owner_resumes(self):
+        self.rows = [self._row("s-sup", lock=5)]
+        self._verdict({"s-sup": ("limited", None)})
+        self.b._ext_scan()
+        self.rows[0]["activity"] = time.time() + 1
+        self.b._ext_scan()
+        self.assertIsNone(self.b.governor.get("ext:s-sup"))
+
+    def test_steal_mode_parks_locked_directly(self):
+        sb.LIMIT_EXT_STEAL = True
+        self.rows = [self._row("s-st", lock=42)]
+        self._verdict({"s-st": ("limited", time.time() + 30)})
+        self.b._ext_scan()
+        e = self.b.governor.get("ext:s-st")
+        self.assertIsNotNone(e)
+        self.assertFalse(e.get("suspect"))
+
+    def test_resume_locked_turns_suspect(self):
+        wd = tempfile.mkdtemp()
+        e = {"kind": "external", "session_id": "s-l",
+             "workdir": wd, "attempt": 1}
+        self.rows = [self._row("s-l", lock=999)]
+        self.b._ext_resume(dict(e))
+        e2 = self.b.governor.get("ext:s-l")
+        self.assertIsNotNone(e2)
+        self.assertTrue(e2.get("suspect"))
+
+    def test_fresh_tails_are_live_and_skipped(self):
+        # Nodes still being written = turn in flight, even if a
+        # limit error was absorbed mid-tail earlier.
+        self.rows = [self._row("s-busy"), self._row("s-busy2", lock=9)]
+        self._verdict({"s-busy": ("limited", None),
+                       "s-busy2": ("limited", None)}, fresh=True)
+        self.b.governor.last_limit_at = time.time()
+        self.b._ext_scan()
+        self.assertIsNone(self.b.governor.get("ext:s-busy2"))
+        # unlocked + fresh limit node = the turn just died, park it
+        e = self.b.governor.get("ext:s-busy")
+        self.assertIsNotNone(e)
+        self.assertFalse(e.get("suspect"))
+
+    def test_locked_fresh_midturn_is_live(self):
+        self.rows = [self._row("s-run", lock=5)]
+        self._verdict({"s-run": ("midturn", None)}, fresh=True)
+        self.b.governor.last_limit_at = time.time()
+        self.b._ext_scan()
+        self.assertIsNone(self.b.governor.get("ext:s-run"))
+
+    def test_unlocked_fresh_midturn_is_live(self):
+        self.rows = [self._row("s-nl")]
+        self._verdict({"s-nl": ("midturn", None)}, fresh=True)
+        self.b._ext_scan()
+        self.assertIsNone(self.b.governor.get("ext:s-nl"))
+
+    def test_acct_switch_pulls_resumes_forward(self):
+        self.b.governor.park("t1", {
+            "kind": "bridge", "text": "x", "session_id": "s",
+            "acct": "aaa", "resume_at": time.time() + 3600})
+        self.b.governor.park("ext:s2", {
+            "kind": "external", "session_id": "s2", "suspect": True,
+            "acct": "aaa", "resume_at": time.time() + 3600})
+        self.b._acct = "aaa"
+        orig = sb._acct_fingerprint
+        sb._acct_fingerprint = lambda: "bbb"
+        try:
+            self.b._acct_drift_check()
+        finally:
+            sb._acct_fingerprint = orig
+        e = self.b.governor.get("t1")
+        self.assertEqual(e["acct"], "bbb")
+        self.assertLess(e["resume_at"], time.time() + 60)
+        # suspects stay watch-only
+        self.assertTrue(self.b.governor.get("ext:s2")["suspect"])
+
+    def test_bridge_owned_sessions_skipped(self):
+        self.rows = [self._row("s-own")]
+        self._verdict({"s-own": ("limited", None)})
+        s = type("S", (), {"session_id": "s-own"})()
+        self.b.sessions["1111.1"] = s
+        self.b._ext_scan()
+        self.assertIsNone(self.b.governor.get("ext:s-own"))
+
+
 if __name__ == "__main__":
     unittest.main()
