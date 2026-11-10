@@ -260,6 +260,10 @@ def _first_line(s, n=40):
     return lines[0][:n] if lines else ""
 
 
+def _one_line(s, n=60):
+    return re.sub(r"\s+", " ", (s or "")).strip()[:n]
+
+
 def devin_lock_pid(sid):
     """Live PID holding <sid>'s lock file, or None (stale/absent = the
     session is free to adopt)."""
@@ -390,6 +394,7 @@ BANG_CMDS = {
     "adopt": "adopt", "takeover": "adopt", "attach": "adopt",
     "handoff": "handoff", "handover": "handoff",
     "release": "release", "detach": "release",
+    "peek": "peek", "look": "peek", "看看": "peek",
     "board": "board", "看板": "board",
 }
 # "!goal <x>" stays a session slash command except these, which the
@@ -408,6 +413,7 @@ HELP_CARD = """*桥命令*（`!` 开头是命令，不带 `!` 就是聊天）
 • `!handoff` — 显示本线程会话 id，桌面 `devin -r` 或会话列表接管
 • `!release` — 桥松开本线程会话（上下文保留，随时可再接回）
 • `!limits` — 限额冷却队列（哪些回合在等重试、何时自动续跑）
+• `!peek [会话id]` — 只看不动：最近几条动态（不接管不抢锁）
 • `!board` — 刷新频道顶部钉住的会话看板
 • `!reload` — 桥服务热重启，在跑的会话不中断
 • `!help` — 本卡片
@@ -1570,7 +1576,8 @@ class SessionBridge:
                  own_user_id=None,
                  channel=CHANNEL, react=None, unreact=None, update=None,
                  upload=None, status=None, open_modal=None,
-                 pin_add=None, pin_list=None, pin_rm=None, team_url=None):
+                 pin_add=None, pin_list=None, pin_rm=None, team_url=None,
+                 ephemeral=None):
         self.post_msg = post
         self.react_msg = react
         self.unreact_msg = unreact
@@ -1581,6 +1588,7 @@ class SessionBridge:
         self.pin_add = pin_add
         self.pin_list = pin_list
         self.pin_rm = pin_rm
+        self.ephemeral_msg = ephemeral
         self.team_url = (team_url or "").rstrip("/")
         self._board_at = 0.0
         self._board_lock = threading.Lock()
@@ -3408,6 +3416,8 @@ class SessionBridge:
             self._release(root)
         elif cmd == "limits":
             self._limits(root, arg)
+        elif cmd == "peek":
+            self._peek(root, arg)
         elif cmd == "board":
             self._board_refresh(manual=True, reply_to=root)
 
@@ -3486,10 +3496,14 @@ class SessionBridge:
             if sid in live:
                 mark = "▶ 桥接管中" + ("（本线程）"
                                        if live[sid] == root else "")
-            elif r["lock_pid"]:
-                mark = "🔒 桌面/CLI 打开中"
             else:
-                mark = "💤 空闲"
+                fresh = self._session_fresh(sid)
+                if fresh and now - fresh < BOARD_LIVE_SEC:
+                    mark = "🔥 " + (self._last_action(sid) or "在跑")
+                elif r["lock_pid"]:
+                    mark = "🔒 桌面/CLI 打开中"
+                else:
+                    mark = "💤 空闲"
             lines.append(f"• `{sid}` {mark} {age}前 — {title}")
         lines.append("桌面接管桥会话：`devin -r <id>` 或 Desktop 会话列表；"
                      "桥会话同在此库中。")
@@ -3614,6 +3628,22 @@ class SessionBridge:
             self.post(root, outcome)
         self._board_touch()
 
+    def _peek(self, root, arg):
+        """`!peek [id]` — spectate a session's recent actions without
+        touching its lock. Bare form peeks at this thread's session."""
+        sid = (arg or "").strip()
+        if not sid:
+            s = self.sessions.get(root)
+            sid = getattr(s, "session_id", None) if s else None
+            if not sid:
+                self.post(root, "`!peek <会话id>` 看它在干嘛（不动锁）;"
+                                "`!sessions` 拿全表。")
+                return
+        if not devin_session(sid):
+            self.post(root, f"找不到会话 `{sid}`（`!sessions` 看可用 id）。")
+            return
+        self.post(root, self._peek_text(sid))
+
     def _handoff(self, root):
         """Surface this thread's session id so a human can pick the
         same conversation up in the CLI (`devin -r`) or the Desktop
@@ -3705,6 +3735,84 @@ class SessionBridge:
         except Exception:
             return None
 
+    def _tail_nodes(self, sid, n=6):
+        """Newest n transcript nodes (oldest→newest) as
+        (parsed_message, created_at) — the raw material for 'what is
+        it doing right now' views."""
+        try:
+            db = _devin_db()
+            try:
+                rows = db.execute(
+                    "SELECT chat_message, created_at FROM message_nodes"
+                    " WHERE session_id=? ORDER BY node_id DESC LIMIT ?",
+                    (sid, n)).fetchall()
+            finally:
+                db.close()
+        except Exception:
+            return []
+        out = []
+        for cm, ts in rows:
+            try:
+                out.append((json.loads(cm), ts))
+            except (ValueError, TypeError):
+                pass
+        return out[::-1]
+
+    @staticmethod
+    def _node_snippet(m):
+        """One transcript node → a phone-length 'what happened'
+        line, e.g. '跑 exec: docker ps' or '回: 已接管'."""
+        role = m.get("role")
+        content = (m.get("content") or "").strip()
+        if role == "assistant":
+            tcs = m.get("tool_calls") or []
+            if tcs:
+                tc = tcs[0]
+                args = tc.get("arguments") or {}
+                if not isinstance(args, dict):
+                    args = {}
+                arg = (args.get("command") or args.get("file_path")
+                       or args.get("path") or args.get("query")
+                       or next(iter(args.values()), ""))
+                extra = f" +{len(tcs) - 1}" if len(tcs) > 1 else ""
+                return f"跑 {tc.get('name', '?')}: " \
+                       f"{_one_line(arg, 50)}{extra}"
+            if content:
+                return "回: " + _one_line(content, 56)
+            return "思考中…"
+        if role == "tool":
+            # 'Output from command in shell xxx:' is transport noise —
+            # the useful part is the output itself.
+            body = re.sub(r"^Output from command in shell \S+:\s*",
+                          "", content)
+            body = re.sub(r"Exit code: \d+", "", body)
+            return "结果: " + _one_line(body or content, 56)
+        if role == "user":
+            return "收到: " + _one_line(content, 56)
+        return _one_line(content, 56)
+
+    def _last_action(self, sid):
+        rows = self._tail_nodes(sid, 1)
+        return self._node_snippet(rows[-1][0]) if rows else ""
+
+    def _peek_text(self, sid):
+        """Read-only 'what is it doing' view — safe to peek at a live
+        session without stealing its lock."""
+        row = devin_session(sid) or {}
+        title = _first_line(row.get("title"), 40) or sid
+        rows = self._tail_nodes(sid, 6)
+        head = f"👀 *{title}* `{sid}` — 最近动态"
+        if not rows:
+            return head + "：暂无记录。"
+        now = time.time()
+        lines = [head]
+        for m, ts in rows:
+            ago = max(0, int(now - (ts or now)))
+            rel = ("刚" if ago < 60 else f"{ago // 60}m前"
+                   if ago < 3600 else f"{ago // 3600}h前")
+            lines.append(f"· _{rel}_ {self._node_snippet(m)}")
+        return "\n".join(lines)
+
     def _board_permalink(self, ts):
         if self.team_url:
             return (f"{self.team_url}/archives/{self.channel}"
@@ -3757,7 +3865,8 @@ class SessionBridge:
                 m = max(0, int(((e.get("resume_at") or now) - now) / 60))
                 cool.append((basis, sid, title, f"⏸ ~{m}m后", age))
             elif fresh and now - fresh < BOARD_LIVE_SEC:
-                hot.append((basis, sid, title, "🔥", age))
+                hot.append((basis, sid, title, "🔥",
+                            self._last_action(sid)))
             else:
                 mark = "📂" if r["lock_pid"] else "💤"
                 idle.append((basis, sid, title, mark, age))
@@ -3775,8 +3884,9 @@ class SessionBridge:
                          f"<{self._board_permalink(ts)}|进去聊>")
         if hot:
             L.append("*🔥 在跑*")
-            for _, sid, title, mark, age in hot[:6]:
-                L.append(f"• *{title}*\n  `{sid}` {mark} {age}")
+            for _, sid, title, mark, action in hot[:6]:
+                L.append(f"• *{title}*\n  `{sid}` {mark} "
+                         f"{action or '进行中'}")
         if cool:
             L.append("*⏸ 限额冷却*")
             for _, sid, title, mark, age in cool[:4]:
@@ -3803,10 +3913,16 @@ class SessionBridge:
                 b["accessory"] = btn
             return b
 
-        def adopt_btn(sid):
-            return {"type": "button", "action_id": "board_adopt",
-                    "text": {"type": "plain_text", "text": "接管"},
-                    "value": sid}
+        def row_actions(sid):
+            """[看看] peeks without stealing (ephemeral); [接管] takes
+            over into a fresh thread."""
+            return {"type": "actions", "elements": [
+                {"type": "button", "action_id": "board_peek",
+                 "text": {"type": "plain_text", "text": "看看"},
+                 "value": sid},
+                {"type": "button", "action_id": "board_adopt",
+                 "text": {"type": "plain_text", "text": "接管"},
+                 "value": sid}]}
 
         blocks = [sec(L[0])]
         for _, _, sid, title, mark, ts in bound[:6]:
@@ -3815,12 +3931,13 @@ class SessionBridge:
                 {"type": "button",
                  "text": {"type": "plain_text", "text": "进去聊"},
                  "url": self._board_permalink(ts)}))
-        for _, sid, title, mark, age in hot[:6]:
-            blocks.append(sec(f"🔥 *{title}*\n`{sid}` · {age}",
-                              adopt_btn(sid)))
+        for _, sid, title, mark, action in hot[:6]:
+            blocks.append(sec(f"🔥 *{title}*\n`{sid}` · "
+                              f"_{action or '进行中'}_"))
+            blocks.append(row_actions(sid))
         for _, sid, title, mark, age in cool[:4]:
-            blocks.append(sec(f"*{title}*\n`{sid}` {mark}",
-                              adopt_btn(sid)))
+            blocks.append(sec(f"*{title}*\n`{sid}` {mark}"))
+            blocks.append(row_actions(sid))
         for line in L[1:]:
             if line.startswith(("📂", "💤")):
                 blocks.append({"type": "context", "elements": [
@@ -3901,6 +4018,21 @@ class SessionBridge:
         if anchor:
             self._adopt(anchor, sid)
 
+    def _board_peek(self, sid, who):
+        """Peek without stealing: the last few transcript actions go
+        to an ephemeral message only the clicker sees. Falls back to a
+        reply under the board itself when no ephemeral transport."""
+        text = self._peek_text(sid)
+        if self.ephemeral_msg and who:
+            try:
+                self.ephemeral_msg(channel=self.channel, user=who,
+                                   text=text)
+                return
+            except Exception as e:
+                self._log_err("ephemeral", e)
+        board = self._board_saved_ts()
+        self.post(board, text)
+
     def handle_interaction(self, payload):
         """Slack interactive payloads: permission option buttons, the
         deny-with-reason modal, and the stop/status controls on the
@@ -3930,6 +4062,11 @@ class SessionBridge:
                     (action.get("selected_option") or {}).get("value")
                 if sid:
                     self._board_adopt(sid)
+                continue
+            if aid == "board_peek":
+                sid = action.get("value")
+                if sid:
+                    self._board_peek(sid, who)
                 continue
             if aid == "perm_reason":
                 is_perm = False
@@ -4348,13 +4485,17 @@ def main():
     def pin_rm(ts):
         web.pins_remove(channel=CHANNEL, timestamp=ts)
 
+    def ephemeral(**kw):
+        web.chat_postEphemeral(**kw)
+
     bridge = SessionBridge(post, own_bot_id=own_bot_id,
                            own_user_id=own_user_id,
                            react=react, unreact=unreact, update=update,
                            upload=upload, status=set_status,
                            open_modal=open_modal,
                            pin_add=pin_add, pin_list=pin_list,
-                           pin_rm=pin_rm, team_url=auth.get("url"))
+                           pin_rm=pin_rm, team_url=auth.get("url"),
+                           ephemeral=ephemeral)
     signal.signal(signal.SIGHUP,
                   lambda *a: bridge.reload_ev.set())
     signal.signal(signal.SIGTERM,

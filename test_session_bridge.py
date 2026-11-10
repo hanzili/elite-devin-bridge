@@ -2056,14 +2056,17 @@ class InteropTest(unittest.TestCase):
         # dropdown offers adoptable sessions without typing ids
         acts = [b_ for b_ in blocks if b_.get("type") == "actions"]
         self.assertTrue(acts)
-        opts = acts[0]["elements"][0].get("options") or []
+        els = [e for b_ in acts for e in b_.get("elements", [])]
+        opts = next(e for e in els
+                    if e.get("type") == "static_select")["options"]
         self.assertTrue(any(o["value"] == "cli-bb" for o in opts))
-        # hot/locked rows get a one-tap adopt button in their section
-        secs = [b_ for b_ in blocks if b_.get("type") == "section"
-                and b_.get("accessory", {}).get("action_id")
-                == "board_adopt"]
-        self.assertTrue(any(s["accessory"]["value"] == "desk-aa"
-                            for s in secs))
+        # hot/locked rows get one-tap 看看 + 接管 buttons in their row
+        self.assertTrue(any(e.get("action_id") == "board_adopt"
+                            and e.get("value") == "desk-aa"
+                            for e in els))
+        self.assertTrue(any(e.get("action_id") == "board_peek"
+                            and e.get("value") == "desk-aa"
+                            for e in els))
 
     def test_board_adopt_button_spawns_thread(self):
         """One tap on the board's 接管 must bind the session into a
@@ -2107,6 +2110,77 @@ class InteropTest(unittest.TestCase):
         finally:
             sb.BOARD_GAP = 30
         self.assertEqual(len(web.posts), n)
+
+    def _seed_nodes(self, sid, msgs):
+        import sqlite3
+        db = sqlite3.connect(self.db_path)
+        for i, (cm, ts) in enumerate(msgs):
+            db.execute("INSERT INTO message_nodes(node_id,session_id,"
+                       "chat_message,created_at) VALUES(?,?,?,?)",
+                       (i + 1, sid, json.dumps(cm), ts))
+        db.commit(); db.close()
+
+    def test_board_hot_row_shows_what_its_doing(self):
+        """A 🔥 row must answer '在干嘛', not repeat a useless '刚' —
+        render the newest transcript action instead of an age."""
+        now = time.time()
+        self._seed_nodes("desk-aa", [
+            ({"role": "assistant",
+              "tool_calls": [{"name": "exec", "arguments":
+                              {"command": "docker ps -a"}}]}, now)])
+        b, web, pinned = self.make_pins_bridge()
+        text, blocks = b._board_render()
+        aa = next(l for l in text.splitlines() if "desk-aa" in l)
+        self.assertIn("🔥", aa)
+        self.assertIn("跑 exec: docker ps -a", aa)
+        self.assertNotIn("刚", aa)
+        sec = next(b_ for b_ in blocks if b_.get("type") == "section"
+                   and "desk-aa" in b_["text"]["text"])
+        self.assertIn("跑 exec: docker ps -a", sec["text"]["text"])
+
+    def test_board_peek_ephemeral_to_clicker_only(self):
+        """看看 = spectate without stealing: an ephemeral answer to
+        the clicker, no channel spam, no lock touched."""
+        now = time.time()
+        self._seed_nodes("desk-aa", [
+            ({"role": "user", "content": "看下 yeeorder 部署"}, now - 30),
+            ({"role": "assistant",
+              "tool_calls": [{"name": "exec", "arguments":
+                              {"command": "docker ps"}}]}, now)])
+        eph = []
+        b, web, pinned = self.make_pins_bridge()
+        b.ephemeral_msg = lambda **kw: eph.append(kw)
+        b.handle_interaction({"type": "block_actions",
+                              "message": {"ts": "bd.z"},
+                              "user": {"id": "U9"},
+                              "actions": [{"action_id": "board_peek",
+                                           "value": "desk-aa"}]})
+        self.assertEqual(len(eph), 1)
+        self.assertEqual(eph[0]["user"], "U9")
+        self.assertIn("docker ps", eph[0]["text"])
+        self.assertIn("看下 yeeorder 部署", eph[0]["text"])
+        self.assertFalse(any("docker ps" in t for _, t in web.posts))
+
+    def test_peek_bang_spectates(self):
+        """`!peek <id>` posts the recent-actions view in-thread."""
+        self._seed_nodes("desk-aa", [
+            ({"role": "assistant", "content": "迁移跑完了，0 错"},
+             time.time())])
+        b, web = make_bridge()
+        b.handle_event(reply_ev("pk.1", "pk.2", "!peek desk-aa"), "EvPK")
+        self.assertTrue(web.wait_for("回: 迁移跑完了", 10))
+
+    def test_peek_bare_uses_thread_session(self):
+        """Bare `!peek` spectates the session bound to this thread."""
+        self._seed_nodes("desk-aa", [
+            ({"role": "user", "content": "hello desk"}, time.time())])
+        b, web = make_bridge()
+        b.handle_event(reply_ev("pb.1", "pb.2", "!adopt desk-aa"),
+                       "EvPB")
+        self.assertTrue(web.wait_for("已接管", 15))
+        b.handle_event(reply_ev("pb.1", "pb.3", "!peek"), "EvPB3")
+        self.assertTrue(web.wait_for("收到: hello desk", 10))
+        b.sessions["pb.1"].terminate()
 
 
 
