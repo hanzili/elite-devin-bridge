@@ -1988,14 +1988,42 @@ class InteropTest(unittest.TestCase):
         top = [t_ for t_, t in web.posts if t_ is None]
         self.assertEqual(len(top), 1)
         self.assertEqual(pinned, [b._board_saved_ts()])
-        # second refresh updates in place, no new post
+        # refresh with unchanged text: no repost, no update call
         n_posts = len(web.posts)
+        n_upd = len(web.updates)
+        b._board_refresh(manual=True)
+        self.assertEqual(len([t_ for t_, t in web.posts if t_ is None]),
+                         1)
+        self.assertEqual(len(web.updates), n_upd)
+        # drifted content still updates in place, never a second post
+        b._board_text = "stale"
         b._board_refresh(manual=True)
         self.assertEqual(len([t_ for t_, t in web.posts if t_ is None]),
                          1)
         self.assertTrue(any(u == b._board_saved_ts()
                             for u, _ in web.updates))
         b.sessions["bd.1"].terminate()
+
+    def test_bang_sessions_at_top_level(self):
+        """`!sessions` typed in the channel (mobile flow) must answer —
+        replies thread under the command message itself."""
+        b, web = make_bridge()
+        b.handle_event(root_ev("tl.1", "!sessions"), "EvTLS")
+        self.assertTrue(web.wait_for("desk-aa", 10))
+        t_ = next(t_ for t_, t in web.posts if "desk-aa" in t)
+        self.assertEqual(t_, "tl.1")
+
+    def test_bang_adopt_at_top_level_binds_anchor(self):
+        """`!adopt <id>` at top level binds the session to a thread
+        anchored on the command message — mobile takeover flow."""
+        b, web = make_bridge()
+        b.handle_event(root_ev("ta.1", "!adopt desk-aa"), "EvTA")
+        self.assertTrue(web.wait_for("已接管", 15))
+        s = b.sessions["ta.1"]
+        self.assertEqual(s.session_id, "desk-aa")
+        b.handle_event(reply_ev("ta.1", "ta.2", "hi"), "EvTA2")
+        self.assertTrue(web.wait_for("✅ 完成", 15))
+        s.terminate()
 
     def test_board_touch_throttled(self):
         b, web, pinned = self.make_pins_bridge()

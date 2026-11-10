@@ -1582,6 +1582,7 @@ class SessionBridge:
         self.pin_rm = pin_rm
         self._board_at = 0.0
         self._board_lock = threading.Lock()
+        self._board_text = None
         self.tasks_dir = tasks_dir
         self.acp_cmd = acp_cmd
         self.timeout = timeout
@@ -2394,6 +2395,11 @@ class SessionBridge:
                         > LIMIT_EXT_SCAN:
                     self._ext_scan_at = time.monotonic()
                     self._ext_scan()
+                # Slow-cadence keep-alive for the pinned board: session
+                # state also drifts outside bridge events (Desktop opens
+                # /closes locks, external resumes finish). The render is
+                # local-only; unchanged text costs no API call.
+                self._board_touch()
             except Exception as e:
                 self._log_err("limit sweep", e)
             time.sleep(LIMIT_SWEEP_SEC)
@@ -2678,6 +2684,7 @@ class SessionBridge:
         finally:
             if s is not None:
                 s.terminate()
+            self._board_touch()
 
     def adopt_limited(self):
         """Pre-feature casualties: workdirs left 'failed'/'interrupted'
@@ -3731,18 +3738,26 @@ class SessionBridge:
             self._board_at = time.monotonic()
             text = self._board_render()
             ts = self._board_saved_ts()
-            updated = bool(ts and self.update_msg
-                           and self._upd(ts, text))
-            if not updated:
-                ts = self.post(None, text)
-                if ts:
-                    self._board_save_ts(ts)
-                    if self.pin_add:
-                        try:
-                            self.pin_add(ts)
-                        except Exception as e:
-                            if _slack_err(e) != "already_pinned":
-                                self._log_err("pin_add", e)
+            # Periodic touches re-render constantly; only hit the API
+            # when the content actually changed, or the board message
+            # itself is missing (repost + repin).
+            if ts and text == self._board_text:
+                updated = True
+            else:
+                updated = bool(ts and self.update_msg
+                               and self._upd(ts, text))
+                if not updated:
+                    ts = self.post(None, text)
+                    if ts:
+                        self._board_save_ts(ts)
+                        if self.pin_add:
+                            try:
+                                self.pin_add(ts)
+                            except Exception as e:
+                                if _slack_err(e) != "already_pinned":
+                                    self._log_err("pin_add", e)
+                if updated or ts:
+                    self._board_text = text
         if reply_to:
             self.post(reply_to, "看板已刷新（频道置顶那条 📋）。")
 
@@ -3967,7 +3982,10 @@ class SessionBridge:
                     and arg.lower() in GOAL_ARG_CLEAR:
                 self._goal_clear_cmd(root)
                 return
-            if not is_root and head in BANG_CMDS:
+            if head in BANG_CMDS:
+                # Top-level commands run too: replies thread under the
+                # command message, so `!adopt` typed in the channel
+                # binds the adopted session to a fresh thread (mobile).
                 self._bang(root, BANG_CMDS[head], arg, ev)
                 return
             if body and body[0].isascii() and body[0].isalpha():
@@ -4239,6 +4257,9 @@ def main():
     socket.connect()
     print(f"session bridge up in {CHANNEL}, tasks dir {TASKS_DIR}",
           flush=True)
+    # First render after boot: whatever the board said before restart
+    # is stale by definition (sessions were restored/adopted/parked).
+    threading.Thread(target=bridge._board_refresh, daemon=True).start()
     try:
         while True:
             if bridge.reload_ev.is_set():
