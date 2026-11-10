@@ -13,9 +13,16 @@ class PackageContractTests(unittest.TestCase):
     def test_private_manifest_minimal_bot_scopes(self):
         manifest = json.loads((ROOT / "manifest.private-channel.draft.json").read_text())
         self.assertEqual(set(manifest["oauth_config"]["scopes"]["bot"]),
-                         {"chat:write", "groups:history", "reactions:write",
-                          "files:read", "files:write",
-                          "pins:read", "pins:write"})
+                         {"app_mentions:read", "assistant:write",
+                          "bookmarks:read", "bookmarks:write",
+                          "calls:read", "calls:write",
+                          "canvases:read", "canvases:write",
+                          "channels:history", "channels:join", "channels:manage",
+                          "chat:write", "commands", "emoji:read",
+                          "files:read", "files:write", "groups:history",
+                          "links:read", "pins:read", "pins:write",
+                          "reactions:read", "reactions:write",
+                          "remote_files:read", "search:read.files"})
 
     def test_private_manifest_only_message_groups(self):
         manifest = json.loads((ROOT / "manifest.private-channel.draft.json").read_text())
