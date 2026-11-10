@@ -325,6 +325,12 @@ LIMIT_EXT = os.environ.get("BRIDGE_LIMIT_EXTERNAL", "1") != "0"
 LIMIT_EXT_STEAL = os.environ.get("BRIDGE_LIMIT_EXT_STEAL", "0") != "0"
 LIMIT_EXT_WINDOW = float(os.environ.get("BRIDGE_LIMIT_EXT_WINDOW",
                                         "3600"))
+# Unlocked victims (stale lock / no owner) get a much longer lookback:
+# an orphaned dead turn stays orphaned, so it is still worth rescuing
+# hours later. Live-locked sessions stay tight — the frontend owner
+# will retry them itself.
+LIMIT_EXT_ORPHAN_WINDOW = float(os.environ.get(
+    "BRIDGE_LIMIT_EXT_ORPHAN_WINDOW", "21600"))
 LIMIT_EXT_SCAN = float(os.environ.get("BRIDGE_LIMIT_EXT_SCAN_SEC", "90"))
 LIMIT_EXT_MAX = int(os.environ.get("BRIDGE_LIMIT_EXT_MAX", "6"))
 LIMIT_EXT_POST = os.environ.get("BRIDGE_LIMIT_EXT_POST", "1") != "0"
@@ -2546,9 +2552,11 @@ class SessionBridge:
         parked_new = 0
         for row in list_devin_sessions(limit=60):
             sid = row["id"]
+            orphan_window = LIMIT_EXT_WINDOW if row["lock_pid"] \
+                else LIMIT_EXT_ORPHAN_WINDOW
             if sid in owned or not row.get("workdir") \
                     or self.governor.get("ext:" + sid) \
-                    or now - row["activity"] > LIMIT_EXT_WINDOW:
+                    or now - row["activity"] > orphan_window:
                 continue
             verdict, reset, node_ts = self._ext_tail_verdict(sid)
             if verdict not in ("limited", "midturn"):
