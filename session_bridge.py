@@ -427,6 +427,7 @@ ADOPT_MAX_AGE = 6 * 3600
 # Dashboard auto-refresh throttle — a burst of session events collapses
 # into one in-place update instead of N chat_update calls.
 BOARD_GAP = int(os.environ.get("BRIDGE_BOARD_GAP", "30"))
+BOARD_LIVE_SEC = int(os.environ.get("BRIDGE_BOARD_LIVE_SEC", "120"))
 # A prompt whose result line sat in the reader's userspace buffer at
 # exec time is unrecoverable; give restored turns a bounded stall
 # before falling back to session/load replay.
@@ -1569,7 +1570,7 @@ class SessionBridge:
                  own_user_id=None,
                  channel=CHANNEL, react=None, unreact=None, update=None,
                  upload=None, status=None, open_modal=None,
-                 pin_add=None, pin_list=None, pin_rm=None):
+                 pin_add=None, pin_list=None, pin_rm=None, team_url=None):
         self.post_msg = post
         self.react_msg = react
         self.unreact_msg = unreact
@@ -1580,6 +1581,7 @@ class SessionBridge:
         self.pin_add = pin_add
         self.pin_list = pin_list
         self.pin_rm = pin_rm
+        self.team_url = (team_url or "").rstrip("/")
         self._board_at = 0.0
         self._board_lock = threading.Lock()
         self._board_text = None
@@ -3687,41 +3689,161 @@ class SessionBridge:
         except OSError:
             pass
 
-    def _board_render(self):
+    def _session_fresh(self, sid):
+        """Newest transcript node ts — the honest 'is it working'
+        signal: a live turn writes nodes continuously, an idle session
+        stays stale no matter who holds the lock."""
+        try:
+            db = _devin_db()
+            try:
+                row = db.execute(
+                    "SELECT MAX(created_at) FROM message_nodes"
+                    " WHERE session_id=?", (sid,)).fetchone()
+            finally:
+                db.close()
+            return row[0] if row and row[0] else None
+        except Exception:
+            return None
+
+    def _board_permalink(self, ts):
+        if self.team_url:
+            return (f"{self.team_url}/archives/{self.channel}"
+                    f"/p{ts.replace('.', '')}?thread_ts={ts}"
+                    f"&cid={self.channel}")
+        return ("https://slack.com/app_redirect?channel="
+                f"{self.channel}&message={ts}")
+
+    def _board_rows(self):
+        """Shared data for text + block renders. Rows are what the
+        user scans on a phone: title first, id demoted, state marks
+        only where they carry information."""
         now = time.time()
-        live = []
+        parked = {e.get("key"): e for e in self.governor.snapshot()}
+        bound, hot, cool, idle = [], [], [], []
         for ts, s in self.sessions.items():
             sid = getattr(s, "session_id", None)
             if not sid:
                 continue
             row = devin_session(sid) or {}
-            title = _first_line(row.get("title"), 26)
-            state = "▶ 执行中" if s.running else "💤 空闲"
-            live.append((s.last_activity_at, sid, title, state, ts))
-        live.sort(reverse=True)
-        lines = ["📋 *Devin 会话看板* · 更新于 "
-                 + time.strftime("%m-%d %H:%M")]
-        if live:
-            lines.append("*桥接管中*（线程内续聊；`!release` 交还）")
-            for _, sid, title, state, ts in live[:8]:
-                lines.append(f"• `{sid}` {state} — {title}")
-        bound = {sid for _, sid, _, _, _ in live}
-        rows = [r for r in list_devin_sessions(10)
-                if r["id"] not in bound]
-        if rows:
-            lines.append("*本机会话*（`!adopt <id>` 接管；桌面 `devin -r` "
-                         "直达）")
-            for r in rows[:8]:
-                ago = int((now - r["activity"]) / 60)
-                age = f"{ago}m" if ago < 60 else f"{ago // 60}h"
-                mark = "🔒" if r["lock_pid"] else "💤"
-                title = _first_line(r["title"], 26)
-                lines.append(f"• `{r['id']}` {mark} {age}前 — {title}")
-        if not live and not rows:
-            lines.append("暂无会话。")
-        lines.append("_💤空闲 · 🔒桌面/CLI 打开中 · "
-                     "线程内 !sessions 看全表_")
-        return "\n".join(lines)
+            title = _first_line(row.get("title"), 42)
+            if s.running:
+                mark, rank = "🔥", 0
+            elif ts in parked or ("ext:" + str(sid)) in parked:
+                e = parked.get(ts) or parked.get("ext:" + str(sid))
+                wait = ""
+                if e and e.get("resume_at"):
+                    m = max(0, int((e["resume_at"] - now) / 60))
+                    wait = f" ~{m}m后"
+                mark, rank = f"⏸{wait}", 1
+            else:
+                mark, rank = "💤", 2
+            bound.append((rank, s.last_activity_at, sid, title, mark, ts))
+        bound.sort(key=lambda x: (x[0], -x[1]))
+        bound_ids = {b[2] for b in bound}
+        for r in list_devin_sessions(15):
+            sid = r["id"]
+            if sid in bound_ids:
+                continue
+            fresh = self._session_fresh(sid)
+            basis = fresh or r["activity"]
+            ago = int((now - basis) / 60)
+            age = ("刚" if ago < 1 else f"{ago}m" if ago < 60
+                   else f"{ago // 60}h" if ago < 1440
+                   else f"{ago // 1440}d")
+            title = _first_line(r["title"], 42)
+            key = "ext:" + str(sid)
+            if key in parked:
+                e = parked[key]
+                m = max(0, int(((e.get("resume_at") or now) - now) / 60))
+                cool.append((basis, sid, title, f"⏸ ~{m}m后", age))
+            elif fresh and now - fresh < BOARD_LIVE_SEC:
+                hot.append((basis, sid, title, "🔥", age))
+            else:
+                mark = "📂" if r["lock_pid"] else "💤"
+                idle.append((basis, sid, title, mark, age))
+        for lst in (hot, cool, idle):
+            lst.sort(key=lambda x: -x[0])
+        return bound, hot, cool, idle
+
+    def _board_render(self):
+        bound, hot, cool, idle = self._board_rows()
+        L = ["📋 *会话看板* · 更新于 " + time.strftime("%m-%d %H:%M")]
+        if bound:
+            L.append("*💬 桥接管中*")
+            for _, _, sid, title, mark, ts in bound[:6]:
+                L.append(f"• *{title}*\n  `{sid}` {mark} — "
+                         f"<{self._board_permalink(ts)}|进去聊>")
+        if hot:
+            L.append("*🔥 在跑*")
+            for _, sid, title, mark, age in hot[:6]:
+                L.append(f"• *{title}*\n  `{sid}` {mark} {age}")
+        if cool:
+            L.append("*⏸ 限额冷却*")
+            for _, sid, title, mark, age in cool[:4]:
+                L.append(f"• *{title}*\n  `{sid}` {mark}")
+        opened = [i for i in idle if i[3] == "📂"]
+        asleep = [i for i in idle if i[3] == "💤"]
+        if opened:
+            names = " · ".join(f"`{i[1]}`" for i in opened[:4])
+            more = f" +{len(opened) - 4}" if len(opened) > 4 else ""
+            L.append(f"📂 桌面开着没跑({len(opened)}):{names}{more}")
+        if asleep:
+            names = " · ".join(f"`{i[1]}`" for i in asleep[:4])
+            more = f" +{len(asleep) - 4}" if len(asleep) > 4 else ""
+            L.append(f"💤 空闲({len(asleep)}):{names}{more}")
+        if not bound and not hot and not cool and not idle:
+            L.append("暂无会话。")
+        L.append("_🔥干活中 ⏸限额冷却 📂被打开没跑 · 下拉接管任意会话_")
+        text = "\n".join(L)
+
+        def sec(txt, btn=None):
+            b = {"type": "section",
+                 "text": {"type": "mrkdwn", "text": txt}}
+            if btn:
+                b["accessory"] = btn
+            return b
+
+        def adopt_btn(sid):
+            return {"type": "button", "action_id": "board_adopt",
+                    "text": {"type": "plain_text", "text": "接管"},
+                    "value": sid}
+
+        blocks = [sec(L[0])]
+        for _, _, sid, title, mark, ts in bound[:6]:
+            blocks.append(sec(
+                f"*{title}*\n`{sid}` {mark}",
+                {"type": "button",
+                 "text": {"type": "plain_text", "text": "进去聊"},
+                 "url": self._board_permalink(ts)}))
+        for _, sid, title, mark, age in hot[:6]:
+            blocks.append(sec(f"🔥 *{title}*\n`{sid}` · {age}",
+                              adopt_btn(sid)))
+        for _, sid, title, mark, age in cool[:4]:
+            blocks.append(sec(f"*{title}*\n`{sid}` {mark}",
+                              adopt_btn(sid)))
+        for line in L[1:]:
+            if line.startswith(("📂", "💤")):
+                blocks.append({"type": "context", "elements": [
+                    {"type": "mrkdwn", "text": line}]})
+        # The adopt launcher: one dropdown = take over any unbound
+        # session — no typing session ids on a phone.
+        pickable = ([i for i in idle] + hot[6:] + cool[4:])[:20]
+        if pickable:
+            blocks.append({"type": "actions", "elements": [
+                {"type": "static_select", "action_id": "board_pick",
+                 "placeholder": {"type": "plain_text",
+                                 "text": "接管其他会话…"},
+                 "options": [
+                     {"text": {"type": "plain_text",
+                               "text": f"{i[3]} {i[2][:44]} · {i[1]}"},
+                     "value": i[1]} for i in pickable]},
+                {"type": "button", "action_id": "board_reload",
+                 "text": {"type": "plain_text", "text": "🔄"}}]})
+        else:
+            blocks.append({"type": "actions", "elements": [
+                {"type": "button", "action_id": "board_reload",
+                 "text": {"type": "plain_text", "text": "🔄 刷新"}}]})
+        return text, blocks
 
     def _board_touch(self):
         """Cheap trigger after session lifecycle events; real refresh
@@ -3736,7 +3858,7 @@ class SessionBridge:
     def _board_refresh(self, manual=False, reply_to=None):
         with self._board_lock:
             self._board_at = time.monotonic()
-            text = self._board_render()
+            text, blocks = self._board_render()
             ts = self._board_saved_ts()
             # Periodic touches re-render constantly; only hit the API
             # when the content actually changed, or the board message
@@ -3745,9 +3867,9 @@ class SessionBridge:
                 updated = True
             else:
                 updated = bool(ts and self.update_msg
-                               and self._upd(ts, text))
+                               and self._upd(ts, text, blocks))
                 if not updated:
-                    ts = self.post(None, text)
+                    ts = self.post(None, text, blocks)
                     if ts:
                         self._board_save_ts(ts)
                         if self.pin_add:
@@ -3760,6 +3882,24 @@ class SessionBridge:
                     self._board_text = text
         if reply_to:
             self.post(reply_to, "看板已刷新（频道置顶那条 📋）。")
+
+    def _board_adopt(self, sid):
+        """Board button/dropdown adopt: spawn a fresh anchor so the
+        takeover lands in its own thread — one tap, zero typing."""
+        row = devin_session(sid)
+        if not row:
+            self.post(None, f"`{sid}` 已不在会话库（可能刚被清理）。")
+            return
+        bound = {ts for ts, s in self.sessions.items()
+                 if getattr(s, "session_id", None) == sid}
+        if bound:
+            self.post(next(iter(bound)),
+                      "这个会话已绑在本线程——直接回复继续。")
+            return
+        anchor = self.post(
+            None, f"📥 接管 `{sid}` —— {_first_line(row.get('title'), 40)}")
+        if anchor:
+            self._adopt(anchor, sid)
 
     def handle_interaction(self, payload):
         """Slack interactive payloads: permission option buttons, the
@@ -3781,6 +3921,15 @@ class SessionBridge:
                 continue
             if aid == "ctl_status":
                 self._status(root)
+                continue
+            if aid == "board_reload":
+                self._board_refresh()
+                continue
+            if aid in ("board_adopt", "board_pick"):
+                sid = action.get("value") or \
+                    (action.get("selected_option") or {}).get("value")
+                if sid:
+                    self._board_adopt(sid)
                 continue
             if aid == "perm_reason":
                 is_perm = False
@@ -4205,7 +4354,7 @@ def main():
                            upload=upload, status=set_status,
                            open_modal=open_modal,
                            pin_add=pin_add, pin_list=pin_list,
-                           pin_rm=pin_rm)
+                           pin_rm=pin_rm, team_url=auth.get("url"))
     signal.signal(signal.SIGHUP,
                   lambda *a: bridge.reload_ev.set())
     signal.signal(signal.SIGTERM,

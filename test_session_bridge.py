@@ -1866,6 +1866,9 @@ class InteropTest(unittest.TestCase):
                    " main_chain_id TEXT, shell_last_seen_index INT,"
                    " cogs_json TEXT, workspace_dirs TEXT,"
                    " hidden INT, metadata TEXT)")
+        db.execute("CREATE TABLE message_nodes(node_id INTEGER"
+                   " PRIMARY KEY, session_id TEXT, chat_message TEXT,"
+                   " created_at REAL)")
         proj_a = os.path.join(self.tmp, "proj-a")
         proj_b = os.path.join(self.tmp, "proj-b")
         proj_c = os.path.join(self.tmp, "proj-c")
@@ -1983,7 +1986,7 @@ class InteropTest(unittest.TestCase):
         web.wait_for("✅ 完成", 15)
         b._board_refresh(manual=True)
         board = [t for t_, t in web.posts
-                 if "Devin 会话看板" in t]
+                 if "会话看板" in t]
         self.assertTrue(board)
         top = [t_ for t_, t in web.posts if t_ is None]
         self.assertEqual(len(top), 1)
@@ -2023,6 +2026,73 @@ class InteropTest(unittest.TestCase):
         self.assertEqual(s.session_id, "desk-aa")
         b.handle_event(reply_ev("ta.1", "ta.2", "hi"), "EvTA2")
         self.assertTrue(web.wait_for("✅ 完成", 15))
+        s.terminate()
+
+    def test_board_shows_real_activity_not_just_lock(self):
+        """🔥 = transcript nodes are fresh (a turn is writing), 📂 =
+        merely open in a frontend (lock held, nothing running), 💤 =
+        idle. A stale-but-locked session must NOT look 'active'."""
+        import sqlite3
+        db = sqlite3.connect(self.db_path)
+        # desk-aa: fresh node = actually working right now
+        db.execute("INSERT INTO message_nodes(session_id,chat_message,"
+                   "created_at) VALUES('desk-aa','{}',?)",
+                   (time.time(),))
+        # cli-bb: last node 3h ago but a live lock file — open, idle
+        db.execute("INSERT INTO message_nodes(session_id,chat_message,"
+                   "created_at) VALUES('cli-bb','{}',?)",
+                   (time.time() - 10800,))
+        db.commit(); db.close()
+        with open(os.path.join(self.lock_dir, "cli-bb.lock"), "w") as f:
+            f.write(str(os.getpid()))
+        b, web, pinned = self.make_pins_bridge()
+        text, blocks = b._board_render()
+        aa = next(l for l in text.splitlines() if "desk-aa" in l)
+        bb = next(l for l in text.splitlines() if "cli-bb" in l)
+        bad = next(l for l in text.splitlines() if "bad-id" in l)
+        self.assertIn("🔥", aa)
+        self.assertIn("📂", bb)
+        self.assertIn("💤", bad)
+        # dropdown offers adoptable sessions without typing ids
+        acts = [b_ for b_ in blocks if b_.get("type") == "actions"]
+        self.assertTrue(acts)
+        opts = acts[0]["elements"][0].get("options") or []
+        self.assertTrue(any(o["value"] == "cli-bb" for o in opts))
+        # hot/locked rows get a one-tap adopt button in their section
+        secs = [b_ for b_ in blocks if b_.get("type") == "section"
+                and b_.get("accessory", {}).get("action_id")
+                == "board_adopt"]
+        self.assertTrue(any(s["accessory"]["value"] == "desk-aa"
+                            for s in secs))
+
+    def test_board_adopt_button_spawns_thread(self):
+        """One tap on the board's 接管 must bind the session into a
+        fresh thread — no command typing on mobile."""
+        b, web, pinned = self.make_pins_bridge()
+        b.handle_interaction({"type": "block_actions",
+                              "message": {"ts": "bd.x"},
+                              "user": {"id": "U1"},
+                              "actions": [{"action_id": "board_adopt",
+                                           "value": "desk-aa"}]})
+        self.assertTrue(web.wait_for("已接管", 15))
+        i = next(i for i, (t_, t) in enumerate(web.posts)
+                 if t_ is None and "接管 `desk-aa`" in t)
+        s = b.sessions[f"m{i + 1}"]
+        self.assertEqual(s.session_id, "desk-aa")
+        s.terminate()
+
+    def test_board_pick_select_adopts(self):
+        b, web, pinned = self.make_pins_bridge()
+        b.handle_interaction({"type": "block_actions",
+                              "message": {"ts": "bd.y"},
+                              "user": {"id": "U1"},
+                              "actions": [{
+                                  "action_id": "board_pick",
+                                  "selected_option":
+                                      {"value": "cli-bb"}}]})
+        self.assertTrue(web.wait_for("已接管", 15))
+        s = next(s for s in b.sessions.values()
+                 if getattr(s, "session_id", None) == "cli-bb")
         s.terminate()
 
     def test_board_touch_throttled(self):
