@@ -433,7 +433,13 @@ ADOPT_MAX_AGE = 6 * 3600
 # Dashboard auto-refresh throttle — a burst of session events collapses
 # into one in-place update instead of N chat_update calls.
 BOARD_GAP = int(os.environ.get("BRIDGE_BOARD_GAP", "30"))
+# 'In flight' windows: a mid-turn node (tool result, user msg,
+# assistant+tool_calls) can legitimately go quiet for a long-running
+# command, so the mid-turn cap is generous; a final assistant answer
+# only holds 🔥 for a short grace (it might precede more tool calls).
 BOARD_LIVE_SEC = int(os.environ.get("BRIDGE_BOARD_LIVE_SEC", "120"))
+BOARD_TURN_CAP = int(os.environ.get("BRIDGE_BOARD_TURN_CAP", "3600"))
+BOARD_MAX_ROWS = int(os.environ.get("BRIDGE_BOARD_MAX_ROWS", "10"))
 # A prompt whose result line sat in the reader's userspace buffer at
 # exec time is unrecoverable; give restored turns a bounded stall
 # before falling back to session/load replay.
@@ -3497,8 +3503,7 @@ class SessionBridge:
                 mark = "▶ 桥接管中" + ("（本线程）"
                                        if live[sid] == root else "")
             else:
-                fresh = self._session_fresh(sid)
-                if fresh and now - fresh < BOARD_LIVE_SEC:
+                if self._turn_live(sid):
                     mark = "🔥 " + (self._last_action(sid) or "在跑")
                 elif r["lock_pid"]:
                     mark = "🔒 桌面/CLI 打开中"
@@ -3795,6 +3800,28 @@ class SessionBridge:
         rows = self._tail_nodes(sid, 1)
         return self._node_snippet(rows[-1][0]) if rows else ""
 
+    def _turn_live(self, sid):
+        """'Is a turn actually in flight?' — the honest running
+        signal. Walk back past `system` context injections (they're
+        appended when a frontend opens a session, not real work) to
+        the newest real node:
+          user / tool result / assistant+tool_calls → mid-turn; live
+              while younger than BOARD_TURN_CAP (long commands write
+              nothing for minutes)
+          assistant final text → the turn ended; it only keeps 🔥
+              for BOARD_LIVE_SEC (a reply may precede more work)
+        """
+        now = time.time()
+        for m, ts in reversed(self._tail_nodes(sid, 8)):
+            if (m.get("role") or "") == "system":
+                continue
+            age = now - ts
+            if m.get("role") == "assistant" \
+                    and not m.get("tool_calls"):
+                return age < BOARD_LIVE_SEC
+            return age < BOARD_TURN_CAP
+        return False
+
     def _peek_text(self, sid):
         """Read-only 'what is it doing' view — safe to peek at a live
         session without stealing its lock."""
@@ -3848,7 +3875,7 @@ class SessionBridge:
             bound.append((rank, s.last_activity_at, sid, title, mark, ts))
         bound.sort(key=lambda x: (x[0], -x[1]))
         bound_ids = {b[2] for b in bound}
-        for r in list_devin_sessions(15):
+        for r in list_devin_sessions(30):
             sid = r["id"]
             if sid in bound_ids:
                 continue
@@ -3864,7 +3891,7 @@ class SessionBridge:
                 e = parked[key]
                 m = max(0, int(((e.get("resume_at") or now) - now) / 60))
                 cool.append((basis, sid, title, f"⏸ ~{m}m后", age))
-            elif fresh and now - fresh < BOARD_LIVE_SEC:
+            elif self._turn_live(sid):
                 hot.append((basis, sid, title, "🔥",
                             self._last_action(sid)))
             else:
@@ -3883,10 +3910,13 @@ class SessionBridge:
                 L.append(f"• *{title}*\n  `{sid}` {mark} — "
                          f"<{self._board_permalink(ts)}|进去聊>")
         if hot:
-            L.append("*🔥 在跑*")
-            for _, sid, title, mark, action in hot[:6]:
+            L.append(f"*🔥 在跑 ({len(hot)})*")
+            for _, sid, title, mark, action in hot[:BOARD_MAX_ROWS]:
                 L.append(f"• *{title}*\n  `{sid}` {mark} "
                          f"{action or '进行中'}")
+            if len(hot) > BOARD_MAX_ROWS:
+                L.append(f"  …另 {len(hot) - BOARD_MAX_ROWS}"
+                         " 个在跑（底部下拉可接管）")
         if cool:
             L.append("*⏸ 限额冷却*")
             for _, sid, title, mark, age in cool[:4]:
@@ -3931,7 +3961,7 @@ class SessionBridge:
                 {"type": "button",
                  "text": {"type": "plain_text", "text": "进去聊"},
                  "url": self._board_permalink(ts)}))
-        for _, sid, title, mark, action in hot[:6]:
+        for _, sid, title, mark, action in hot[:BOARD_MAX_ROWS]:
             blocks.append(sec(f"🔥 *{title}*\n`{sid}` · "
                               f"_{action or '进行中'}_"))
             blocks.append(row_actions(sid))
@@ -3944,7 +3974,7 @@ class SessionBridge:
                     {"type": "mrkdwn", "text": line}]})
         # The adopt launcher: one dropdown = take over any unbound
         # session — no typing session ids on a phone.
-        pickable = ([i for i in idle] + hot[6:] + cool[4:])[:20]
+        pickable = ([i for i in idle] + hot[BOARD_MAX_ROWS:] + cool[4:])[:20]
         if pickable:
             blocks.append({"type": "actions", "elements": [
                 {"type": "static_select", "action_id": "board_pick",

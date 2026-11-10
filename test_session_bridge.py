@@ -2114,10 +2114,12 @@ class InteropTest(unittest.TestCase):
     def _seed_nodes(self, sid, msgs):
         import sqlite3
         db = sqlite3.connect(self.db_path)
+        base = (db.execute("SELECT COALESCE(MAX(node_id),0) "
+                           "FROM message_nodes").fetchone()[0])
         for i, (cm, ts) in enumerate(msgs):
             db.execute("INSERT INTO message_nodes(node_id,session_id,"
                        "chat_message,created_at) VALUES(?,?,?,?)",
-                       (i + 1, sid, json.dumps(cm), ts))
+                       (base + i + 1, sid, json.dumps(cm), ts))
         db.commit(); db.close()
 
     def test_board_hot_row_shows_what_its_doing(self):
@@ -2137,6 +2139,44 @@ class InteropTest(unittest.TestCase):
         sec = next(b_ for b_ in blocks if b_.get("type") == "section"
                    and "desk-aa" in b_["text"]["text"])
         self.assertIn("跑 exec: docker ps -a", sec["text"]["text"])
+
+    def test_long_running_turn_stays_hot(self):
+        """A turn mid-flight writes nothing while a long command runs;
+        🔥 must not flicker off at the 2-min freshness edge. The real
+        signal is turn position: newest real node is a tool result /
+        user msg / tool call → still in flight."""
+        now = time.time()
+        # desk-aa: tool result landed 5 min ago, long op still running
+        self._seed_nodes("desk-aa", [
+            ({"role": "tool", "content": "Output from command: build"},
+             now - 300)])
+        # cli-bb: turn ENDED — final assistant answer 10 min ago
+        self._seed_nodes("cli-bb", [
+            ({"role": "assistant", "content": "全部完成了"},
+             now - 600)])
+        b, web, pinned = self.make_pins_bridge()
+        text, blocks = b._board_render()
+        aa = next(l for l in text.splitlines() if "desk-aa" in l)
+        bb = next(l for l in text.splitlines() if "cli-bb" in l)
+        self.assertIn("🔥", aa)
+        self.assertIn("结果:", aa)
+        self.assertNotIn("🔥", bb)
+        self.assertIn("💤", bb)
+
+    def test_system_injection_is_not_activity(self):
+        """`system` context nodes are appended when a frontend opens
+        a session — not work. A session whose tail is only system
+        injections must NOT render 🔥 even if the injection is fresh."""
+        now = time.time()
+        self._seed_nodes("desk-aa", [
+            ({"role": "assistant", "content": "done, all good"},
+             now - 900),
+            ({"role": "system", "content": "<system_info>ctx"},
+             now - 5)])
+        b, web, pinned = self.make_pins_bridge()
+        text, blocks = b._board_render()
+        aa = next(l for l in text.splitlines() if "desk-aa" in l)
+        self.assertNotIn("🔥", aa)
 
     def test_board_peek_ephemeral_to_clicker_only(self):
         """看看 = spectate without stealing: an ephemeral answer to
