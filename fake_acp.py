@@ -276,6 +276,29 @@ def main():
             if MODE == "dieonce" and not os.path.exists(".dieonce"):
                 open(".dieonce", "w").close()
                 os._exit(3)
+            if MODE == "ratelimit" and \
+                    not os.path.exists(".ratelimit"):
+                open(".ratelimit", "w").close()
+                send({"jsonrpc": "2.0", "id": mid,
+                      "error": {"code": -32603,
+                                "message": "Reached free model rate "
+                                "limit. Upgrade to Max for higher "
+                                "limits, or switch to a different "
+                                "model. Your limit will reset in "
+                                "2 seconds (at Nov 10 00:00 UTC)."}})
+                continue
+            if MODE == "unavailable" and \
+                    not os.path.exists(".unavailable"):
+                open(".unavailable", "w").close()
+                send({"jsonrpc": "2.0", "id": mid,
+                      "error": {"code": -32010,
+                                "message": "Connection error, send a "
+                                "message to continue retrying",
+                                "data": {"cognition.ai/errorKind":
+                                         "unavailable",
+                                         "cognition.ai/retryable":
+                                         True}}})
+                continue
             if MODE in ("silent", "spawn", "hanginit"):
                 continue
             threading.Thread(target=do_prompt,

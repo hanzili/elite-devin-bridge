@@ -32,6 +32,14 @@ ask for permission — is handled by the bridge, not by prompting the model.
   restores live sessions (`7 live-restored` in production). In-flight
   prompts are recorded and replayed after hard death; a 🔄 notice is
   posted into each restored thread.
+- **Limit governor** — turns killed by server-side limits ("Reached …
+  rate limit" / retryable refusals) park into a durable cooldown
+  registry instead of failing, wait out the server's own reset window
+  (or bounded backoff), then resume staggered so a batch can't re-trip
+  the cap. Desktop/CLI sessions the same account-level limit took out
+  are detected via the shared session store and resumed through
+  `session/load`. Event history in `.bridge_limits.log`, `!limits` for
+  the live queue; see `LIMIT_GOVERNOR.md`.
 - **Streaming & chunking** — live draft message updated in place, with
   overflow spilling into follow-up posts and a smaller `chat.update`
   budget to avoid `msg_too_long` storms.

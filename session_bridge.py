@@ -73,12 +73,21 @@ Opt: DEVIN_TASKS_DIR (~/devin-tasks), SESSION_IDLE_SEC (3600),
      BRIDGE_GOAL_WATCH_SEC (3) — idle watcher period for
      .devin-goal-native / .devin-goal files, which are attached as
      native /goal (claimed by rename to *.attached).
+     BRIDGE_LIMIT_* — server-side limit governor: turns killed by
+     "Reached … rate limit" / retryable refusals park into
+     .bridge_limits.json and auto-resume after the server's reset
+     window (or backoff 30s→300s), one per RESUME_GAP, up to
+     RESUME_MAX (8). Desktop/CLI sessions whose transcript tail shows
+     the same stall are resumed via session/load when EXTERNAL=1
+     (lock takeover EXT_STEAL=1, lookback EXT_WINDOW=3600s, per-scan
+     cap EXT_MAX=6). History: .bridge_limits.log, `!limits` in Slack.
 """
 import array
 import json
 import math
 import os
 import queue
+import random
 import re
 import shlex
 import shutil
@@ -91,6 +100,8 @@ import time
 import unicodedata
 import urllib.request
 from collections import deque
+
+import limit_governor
 
 TASKS_DIR = os.path.expanduser(os.environ.get("DEVIN_TASKS_DIR", "~/devin-tasks"))
 IDLE_SEC = float(os.environ.get("SESSION_IDLE_SEC", "3600"))
@@ -119,7 +130,9 @@ THINK_ENABLED = os.environ.get("BRIDGE_THINK", "0") != "0"
 THINK_POST_MAX = int(os.environ.get("BRIDGE_THINK_MAX", "3000"))
 REACT_WORKING = "hourglass_flowing_sand"
 REACT_RELOADING = "arrows_counterclockwise"
-REACTS_ALL = {REACT_WORKING, REACT_RELOADING, "white_check_mark",
+REACT_LIMITED = "double_vertical_bar"
+REACTS_ALL = {REACT_WORKING, REACT_RELOADING, REACT_LIMITED,
+              "white_check_mark",
               "octagonal_sign", "alarm_clock", "boom", "x", "zzz"}
 CHANNEL = os.environ.get("SLACK_CHANNEL_ID", "")
 # Senders the bridge must ignore completely — matched against an
@@ -274,6 +287,39 @@ GOAL_FILES = (".devin-goal-native", ".devin-goal")
 GOAL_STATUS_CN = {"running": "进行中", "paused": "已暂停",
                   "blocked": "已阻塞", "complete": "已完成",
                   "cleared": "已清除"}
+# Server-side limit handling: a turn killed by "Reached … rate limit"
+# or a retryable refusal parks into .bridge_limits.json instead of
+# failing; the sweeper re-runs it after the server's quoted reset
+# window (or bounded backoff), one resume per BRIDGE_LIMIT_RESUME_GAP
+# seconds so a batch doesn't re-trip the cap in lockstep. The same
+# watcher scans the shared devin session store for Desktop/CLI sessions
+# whose transcript tail shows they stalled on the limit; those are
+# resumed via session/load + a nudge prompt (their session lock is
+# taken over when BRIDGE_LIMIT_EXT_STEAL=1, since a dead turn can't be
+# retried by the other frontend anyway). History lands in
+# .bridge_limits.log (JSONL).
+LIMIT_RESUME_MAX = int(os.environ.get("BRIDGE_LIMIT_RESUME_MAX", "8"))
+LIMIT_BASE_BACKOFF = float(os.environ.get("BRIDGE_LIMIT_BACKOFF", "30"))
+LIMIT_BACKOFF_CAP = float(os.environ.get("BRIDGE_LIMIT_BACKOFF_CAP",
+                                         "300"))
+LIMIT_RESUME_GAP = float(os.environ.get("BRIDGE_LIMIT_RESUME_GAP",
+                                        "15"))
+LIMIT_SWEEP_SEC = float(os.environ.get("BRIDGE_LIMIT_SWEEP_SEC", "15"))
+LIMIT_ADOPT_AGE = float(os.environ.get("BRIDGE_LIMIT_ADOPT_AGE",
+                                       "21600"))
+LIMIT_EXT = os.environ.get("BRIDGE_LIMIT_EXTERNAL", "1") != "0"
+LIMIT_EXT_STEAL = os.environ.get("BRIDGE_LIMIT_EXT_STEAL", "1") != "0"
+LIMIT_EXT_WINDOW = float(os.environ.get("BRIDGE_LIMIT_EXT_WINDOW",
+                                        "3600"))
+LIMIT_EXT_SCAN = float(os.environ.get("BRIDGE_LIMIT_EXT_SCAN_SEC", "90"))
+LIMIT_EXT_MAX = int(os.environ.get("BRIDGE_LIMIT_EXT_MAX", "6"))
+LIMIT_EXT_POST = os.environ.get("BRIDGE_LIMIT_EXT_POST", "1") != "0"
+EXT_RESUME_PROMPT = os.environ.get(
+    "BRIDGE_LIMIT_EXT_PROMPT",
+    "（自动恢复：服务端限额冷却已结束）请继续完成刚才被中断的工作；"
+    "如果上一轮其实已经做完，简短回复已完成即可。")
+RESUME_NUDGE = ("（自动恢复：上一轮因服务端限额中断）请继续未完成的"
+                "工作；如果已经做完，简短回复已完成即可。")
 AGENTS_TMPL = """# 桥会话上下文
 
 - 本目录绑定 Slack 线程 {ts}，是你与该线程的持久工作目录。
@@ -298,6 +344,7 @@ ALLOW_WORDS = {"允许", "allow", "approve", "同意", "批准"}
 DENY_WORDS = {"拒绝", "deny", "reject"}
 GOAL_CLEAR_WORDS = {"取消目标", "清除目标", "清空目标", "删除目标",
                     "取消goal", "goal clear", "clear goal"}
+LIMIT_WORDS = {"限额", "限流", "冷却队列", "限额队列", "限额状态"}
 RELOAD_WORDS = {"桥重启", "重启桥", "热重启", "桥reload", "reload bridge"}
 HELP_WORDS = {"帮助", "help", "使用说明", "命令帮助", "怎么使用",
               "怎么用", "操作说明"}
@@ -313,6 +360,7 @@ BANG_CMDS = {
     "deny": "deny", "reject": "deny", "no": "deny", "n": "deny",
     "approvals": "approvals", "perms": "approvals", "perm": "approvals",
     "reset": "reset", "new": "reset", "wipe": "reset",
+    "limits": "limits", "limit": "limits", "cooldown": "limits",
     "sessions": "sessions", "ls": "sessions", "list": "sessions",
     "adopt": "adopt", "takeover": "adopt", "attach": "adopt",
     "handoff": "handoff", "handover": "handoff",
@@ -334,6 +382,7 @@ HELP_CARD = """*桥命令*（`!` 开头是命令，不带 `!` 就是聊天）
 • `!adopt [会话id]` — 接管桌面/CLI 会话到本线程；不带 id 接管最近一个
 • `!handoff` — 显示本线程会话 id，桌面 `devin -r` 或会话列表接管
 • `!release` — 桥松开本线程会话（上下文保留，随时可再接回）
+• `!limits` — 限额冷却队列（哪些回合在等重试、何时自动续跑）
 • `!board` — 刷新频道顶部钉住的会话看板
 • `!reload` — 桥服务热重启，在跑的会话不中断
 • `!help` — 本卡片
@@ -371,6 +420,7 @@ STATE_NAMES = {
     "crashed": "进程异常退出",
     "interrupted": "已中断（桥服务重启）",
     "reaped": "已回收（空闲超时）",
+    "rate_limited": "限额冷却中（待自动重试）",
 }
 
 # Serializes every read-modify-write of the per-thread state and
@@ -391,6 +441,9 @@ class AcpError(RuntimeError):
     Slack as a raw dict repr."""
 
     def __init__(self, err):
+        data = err.get("data") if isinstance(err, dict) else None
+        self.data = data or {}
+        self.error_kind = self.data.get("cognition.ai/errorKind")
         self.retryable = isinstance(err, dict) and bool(
             (err.get("data") or {}).get("cognition.ai/retryable"))
         msg = (err.get("message") or str(err)) \
@@ -1527,6 +1580,10 @@ class SessionBridge:
         self._err_seen = set()
         self._err_last = {}
         self._reacted = {}
+        self.governor = limit_governor.Governor(
+            tasks_dir, printer=lambda m: print(m, flush=True))
+        self.limit_attempts = {}
+        self._ext_scan_at = 0.0
 
     def _log_err(self, label, e):
         err = _slack_err(e)
@@ -2251,6 +2308,329 @@ class SessionBridge:
                               + ("" if dead else "（进程退出未确认）")
                               + "。")
 
+    # ---- limit governor -------------------------------------------
+
+    def _limit_park(self, ts, s, text, msg_ts, exc):
+        """Park a turn killed by a server-side limit into the cooldown
+        registry. True → caller skips the failure card; False → not a
+        limit error, or the retry budget is spent (generic failure
+        handling proceeds, whose rate-limit regex still renders a
+        sensible detail line)."""
+        info = limit_governor.classify_error(exc)
+        if info is None:
+            return False
+        attempt = self.limit_attempts.get(ts, 0) + 1
+        if attempt > LIMIT_RESUME_MAX:
+            return False
+        self.limit_attempts[ts] = attempt
+        now = time.time()
+        reset_at = info.get("reset_at")
+        if reset_at and reset_at > now:
+            resume_at = reset_at + random.uniform(2, 12)
+            wait_for = ("到 "
+                        + time.strftime("%H:%M",
+                                        time.localtime(resume_at)))
+        else:
+            delay = limit_governor.backoff(attempt, LIMIT_BASE_BACKOFF,
+                                           LIMIT_BACKOFF_CAP)
+            resume_at = now + delay
+            wait_for = f"约 {_dur(delay)} 后"
+        live = sum(1 for x in self.sessions.values() if x.alive)
+        active = sum(1 for x in self.sessions.values() if x.running)
+        self.governor.park(ts, {
+            "kind": "bridge", "text": text, "msg_ts": msg_ts,
+            "session_id": getattr(s, "session_id", None),
+            "error": info["message"][:300], "error_kind": info["kind"],
+            "reset_at": reset_at, "resume_at": resume_at,
+            "attempt": attempt,
+            "live_sessions": live, "active_turns": active})
+        write_state(s.workdir, "rate_limited", s.last_activity,
+                    f"{info['kind']}，{wait_for}自动重试"
+                    f"（第 {attempt} 次）")
+        self._react_state(ts, REACT_LIMITED)
+        self._status_line(s, f"⏸️ 限额冷却 · {wait_for}自动重试")
+        self.post(ts, f"⏸️ 触发服务端限额（{info['kind']}），本回合挂起，"
+                      f"{wait_for}自动重试"
+                      f"（第 {attempt}/{LIMIT_RESUME_MAX} 次）。"
+                      "回复任意消息立即重试；`!limits` 看冷却队列。")
+        self._board_touch()
+        return True
+
+    def limit_sweeper(self):
+        """Cooldown scheduler: fire due resumes at most one per
+        LIMIT_RESUME_GAP; on a slower cadence scan the shared session
+        store for Desktop/CLI sessions the same limit took out."""
+        while True:
+            try:
+                self._limit_sweep()
+                if LIMIT_EXT and time.monotonic() - self._ext_scan_at \
+                        > LIMIT_EXT_SCAN:
+                    self._ext_scan_at = time.monotonic()
+                    self._ext_scan()
+            except Exception as e:
+                self._log_err("limit sweep", e)
+            time.sleep(LIMIT_SWEEP_SEC)
+
+    def _limit_sweep(self):
+        now = time.time()
+        if now - self.governor.last_resume_at < LIMIT_RESUME_GAP:
+            return
+        due = self.governor.due(now)
+        if not due:
+            return
+        key, entry = due[0]
+        self.governor.pop(key, "dispatch")
+        self.governor.last_resume_at = now
+        self.governor.event("resume_attempt", key=key,
+                            attempt=entry.get("attempt"),
+                            session=entry.get("session_id"))
+        if entry.get("kind") == "external":
+            threading.Thread(target=self._ext_resume, args=(entry,),
+                             daemon=True).start()
+            return
+        s = self.sessions.get(key)
+        if s and s.alive:
+            self.post(key, "🔄 限额冷却结束，重试上一回合…")
+            threading.Thread(
+                target=self._run_prompt,
+                args=(key, entry.get("text") or RESUME_NUDGE, None),
+                kwargs={"msg_ts": entry.get("msg_ts")},
+                daemon=True).start()
+        elif entry.get("session_id"):
+            threading.Thread(
+                target=self._resume_session,
+                args=(key, entry.get("text") or RESUME_NUDGE, None,
+                      entry["session_id"]),
+                kwargs={"msg_ts": entry.get("msg_ts"),
+                        "replayed": True},
+                daemon=True).start()
+        else:
+            self.governor.event("resume_skip", key=key,
+                                reason="no_session")
+
+    # ---- external (Desktop/CLI) victims ---------------------------
+
+    def _bridge_session_ids(self):
+        owned = {getattr(s, "session_id", None)
+                 for s in self.sessions.values()}
+        try:
+            for name in os.listdir(self.tasks_dir):
+                st = read_state(os.path.join(self.tasks_dir, name))
+                if st and st.get("session_id"):
+                    owned.add(st["session_id"])
+        except OSError:
+            pass
+        for e in self.governor.snapshot():
+            if e.get("session_id"):
+                owned.add(e["session_id"])
+        owned.discard(None)
+        return owned
+
+    def _ext_tail_verdict(self, sid, tail=6):
+        """-> (verdict, reset_at|None): the session's last transcript
+        nodes say 'limited' (a rate-limit error sits in the tail),
+        'midturn' (turn cut mid-flight), or 'idle'."""
+        try:
+            db = _devin_db()
+            try:
+                rows = db.execute(
+                    "SELECT chat_message FROM message_nodes"
+                    " WHERE session_id=? ORDER BY node_id DESC LIMIT ?",
+                    (sid, tail)).fetchall()
+            finally:
+                db.close()
+        except Exception:
+            return "idle", None
+        nodes = []
+        for (cm,) in rows:
+            try:
+                nodes.append(json.loads(cm))
+            except ValueError:
+                continue
+        verdict = limit_governor.tail_verdict(nodes)
+        reset = None
+        if verdict == "limited":
+            for j in nodes[:5]:
+                c = j.get("content") or ""
+                if limit_governor.TOOL_LIMIT_RE.match(c):
+                    reset = limit_governor.parse_reset(c)
+                    break
+        return verdict, reset
+
+    def _ext_scan(self):
+        """Park external sessions the limit took out: transcript tail
+        shows a rate-limit node, or the tail ends mid-turn while a
+        limit window is open (a bridge turn just hit one)."""
+        now = time.time()
+        owned = self._bridge_session_ids()
+        window_open = now - self.governor.last_limit_at \
+            < LIMIT_EXT_WINDOW
+        parked_new = 0
+        for row in list_devin_sessions(limit=60):
+            sid = row["id"]
+            if sid in owned or not row.get("workdir") \
+                    or self.governor.get("ext:" + sid) \
+                    or now - row["activity"] > LIMIT_EXT_WINDOW:
+                continue
+            verdict, reset = self._ext_tail_verdict(sid)
+            if verdict != "limited" and not (
+                    verdict == "midturn" and window_open):
+                continue
+            entry = {"kind": "external", "session_id": sid,
+                     "workdir": row["workdir"],
+                     "title": row.get("title") or "",
+                     "error_kind": "rate_limited",
+                     "reset_at": reset,
+                     "resume_at": (reset + random.uniform(2, 12))
+                     if reset else now + limit_governor.backoff(
+                         1, LIMIT_BASE_BACKOFF, LIMIT_BACKOFF_CAP)}
+            self.governor.park("ext:" + sid, entry)
+            parked_new += 1
+            if parked_new >= LIMIT_EXT_MAX:
+                break
+
+    def _ext_resume(self, entry):
+        """Drive one stalled external session back to life: steal the
+        (dead-turn) session lock if a frontend still holds it, spawn a
+        one-shot acp, session/load, then prompt it to continue."""
+        sid = entry.get("session_id")
+        wd = entry.get("workdir")
+        if not sid or not wd or not os.path.isdir(wd):
+            self.governor.event("external_skip", session=sid,
+                                reason="workdir_gone")
+            return
+        pid = devin_lock_pid(sid)
+        if pid and not LIMIT_EXT_STEAL:
+            self.governor.event("external_locked", session=sid, pid=pid)
+            e = dict(entry)
+            e.pop("attempt", None)
+            e["resume_at"] = time.time() + 300
+            self.governor.park("ext:" + sid, e)
+            return
+        if pid:
+            try:
+                os.unlink(os.path.join(DEVIN_LOCKS, sid + ".lock"))
+                self.governor.event("external_lock_steal",
+                                    session=sid, pid=pid)
+            except OSError:
+                pass
+        ext_wd = os.path.join(self.tasks_dir, ".ext_sessions", sid)
+        s = None
+        try:
+            s = DevinSession(None, ext_wd, self.acp_cmd, self.timeout,
+                             acp_cwd=wd)
+            s.start(resume_id=sid, strict_load=True)
+            reply, reason = s.prompt(EXT_RESUME_PROMPT,
+                                     lambda *a: None,
+                                     threading.Event())
+            self.governor.event("external_resumed", session=sid,
+                                stop=reason)
+            self.limit_attempts.pop("ext:" + sid, None)
+            if LIMIT_EXT_POST:
+                title = _first_line(entry.get("title")) or sid
+                self.post(None, "🔄 限额恢复：桌面/CLI 会话 "
+                                f"`{sid}`（{title}）已自动续跑。")
+        except Exception as e:
+            info = limit_governor.classify_error(e)
+            if info and entry.get("attempt", 1) < LIMIT_RESUME_MAX:
+                e2 = dict(entry)
+                e2.pop("attempt", None)
+                e2["error"] = info["message"][:300]
+                e2["error_kind"] = info["kind"]
+                e2["reset_at"] = info.get("reset_at")
+                e2["resume_at"] = (
+                    info["reset_at"] + random.uniform(2, 12)
+                    if info.get("reset_at") else
+                    time.time() + limit_governor.backoff(
+                        entry.get("attempt", 1)))
+                self.governor.park("ext:" + sid, e2)
+            else:
+                self.governor.event("external_fail", session=sid,
+                                    error=f"{type(e).__name__}: {e}")
+        finally:
+            if s is not None:
+                s.terminate()
+
+    def adopt_limited(self):
+        """Pre-feature casualties: workdirs left 'failed'/'interrupted'
+        on a limit signature (or still showing a cooldown state the
+        registry lost) get parked for auto-resume instead of waiting
+        for someone to reply by hand."""
+        adopted = []
+        try:
+            names = os.listdir(self.tasks_dir)
+        except OSError:
+            return adopted
+        now = time.time()
+        for name in names:
+            wd = os.path.join(self.tasks_dir, name)
+            st = read_state(wd)
+            if not st or not st.get("session_id"):
+                continue
+            if st.get("state") not in ("failed", "interrupted",
+                                       "rate_limited"):
+                continue
+            if now - st.get("updated", 0) > LIMIT_ADOPT_AGE:
+                continue
+            detail = st.get("detail") or ""
+            limited = st.get("state") == "rate_limited" \
+                or limit_governor.LIMIT_RE.search(detail) \
+                or "continue retrying" in detail
+            if not limited:
+                continue
+            ts = ".".join(name.rsplit("_", 1))
+            if self.governor.get(ts):
+                continue
+            self.governor.park(ts, {
+                "kind": "bridge", "text": RESUME_NUDGE,
+                "session_id": st["session_id"],
+                "error": (detail or "resumed_after_restart")[:300],
+                "error_kind": "rate_limited",
+                "resume_at": now + random.uniform(10, 40)})
+            adopted.append(ts)
+            self._react_state(ts, REACT_LIMITED)
+        return adopted
+
+    def _limits(self, root, arg=""):
+        """!limits: cooldown queue + recent limit events, or drop this
+        thread's parked turn with `!limits clear`."""
+        if (arg or "").strip().lower() in ("clear", "drop", "取消"):
+            e = self.governor.pop(root, "manual_clear")
+            self.post(root, "已取消本线程的限额重试。" if e
+                      else "本线程没有在冷却的回合。")
+            return
+        parked = self.governor.snapshot()
+        now = time.time()
+        lines = []
+        if parked:
+            lines.append("*冷却队列*")
+            for e in parked:
+                if e.get("kind") == "external":
+                    who = "桌面/CLI"
+                elif e["key"] == root:
+                    who = "本线程"
+                else:
+                    who = f"线程 {e['key']}"
+                wait = int(e.get("resume_at", 0) - now)
+                lines.append(
+                    f"• {who} `{e.get('session_id') or '?'}` "
+                    f"{e.get('error_kind')} · 第 "
+                    f"{e.get('attempt', '?')} 次 · "
+                    + (f"{wait}s 后重试" if wait > 0 else "待调度"))
+        else:
+            lines.append("冷却队列是空的。")
+        evs = self.governor.events_tail(8)
+        if evs:
+            lines.append("*最近限额事件*")
+            for e in evs:
+                t = time.strftime("%H:%M:%S",
+                                  time.localtime(e.get("t", 0)))
+                who = e.get("key") or e.get("session") or ""
+                desc = (e.get("error") or "")[:60]
+                lines.append(f"• {t} `{e.get('event')}` {who}"
+                             + (f" — {desc}" if desc else ""))
+        self.post(root, "\n".join(lines))
+
     def _seed_workdir(self, workdir, ts):
         """Drop an AGENTS.md wiring shared + thread memory into the
         session's context, and seed the shared memory file."""
@@ -2380,6 +2760,10 @@ class SessionBridge:
         s = self.sessions.get(ts)
         if not s:
             return
+        # Any fresh prompt supersedes a parked one — the sweeper already
+        # popped the entry it's dispatching, and a human reply shouldn't
+        # later be shadowed by a stale auto-resume of the old turn.
+        self.governor.pop(ts, "new_turn")
         if text.lstrip().startswith("/goal"):
             cleared = _goal_cleared_path(s.workdir)
             if os.path.exists(cleared):
@@ -2426,6 +2810,7 @@ class SessionBridge:
                 return
             flag.clear()
             self.crash_retries.pop(ts, None)
+            self.limit_attempts.pop(ts, None)
             write_state(s.workdir, "idle", s.last_activity,
                         "任务已取消" if reason in
                         ("cancelled", "queued_cancelled")
@@ -2498,7 +2883,11 @@ class SessionBridge:
                              if not retries else
                              "自动恢复后再次退出，会话已结束。")
         except Exception as e:
+            parked = (not flag.is_set()
+                      and self._limit_park(ts, s, text, msg_ts, e))
             flag.clear()
+            if parked:
+                return
             write_state(s.workdir, "failed", s.last_activity,
                         f"{type(e).__name__}: {e}")
             hint = ("；回复本线程任意消息可让它重试"
@@ -2617,6 +3006,8 @@ class SessionBridge:
                          goal_replay=replayed)
 
     def _stop(self, root):
+        self.governor.pop(root, "stopped")
+        self.limit_attempts.pop(root, None)
         s = self.sessions.get(root)
         if not s:
             with self.lock:
@@ -2768,6 +3159,13 @@ class SessionBridge:
                                 f"{(g.get('objective') or '')[:60]} "
                                 f"（{GOAL_STATUS_CN.get(g.get('status'), '?')}"
                                 f" · turn {g.get('turns', '?')}）")
+            parked = self.governor.get(root)
+            if parked:
+                wait = int(parked.get("resume_at", 0) - time.time())
+                self.post(root, "⏸️ 限额冷却中："
+                                + (f"{wait}s 后" if wait > 0 else "即将")
+                                + f"自动重试（第 "
+                                  f"{parked.get('attempt', '?')} 次）。")
             return
         if root in self.starting:
             self.post(root, "状态: 启动中")
@@ -2867,6 +3265,8 @@ class SessionBridge:
             self._handoff(root)
         elif cmd == "release":
             self._release(root)
+        elif cmd == "limits":
+            self._limits(root, arg)
         elif cmd == "board":
             self._board_refresh(manual=True, reply_to=root)
 
@@ -2892,6 +3292,8 @@ class SessionBridge:
     def _reset(self, root):
         """Drop the session binding; the next in-thread reply starts a
         brand-new session on the same workdir."""
+        self.governor.pop(root, "reset")
+        self.limit_attempts.pop(root, None)
         s = self.sessions.get(root)
         if s and (s.running or s.queued):
             self.post(root, "会话还在执行，先 `!stop` 再 `!reset`。")
@@ -3494,6 +3896,8 @@ class SessionBridge:
             self.post(root, "收到，桥服务热重启（在跑的会话不中断）。")
         elif low in STATUS_WORDS:
             self._status(root)
+        elif low in LIMIT_WORDS:
+            self._limits(root, "")
         elif low in APPROVAL_WORDS:
             self._approvals(root)
         elif low in ALLOW_WORDS:
@@ -3558,6 +3962,7 @@ class SessionBridge:
             self._reap_idle_auto()
             idle = [ts for ts, s in list(self.sessions.items())
                     if not s.running and s.queued == 0
+                    and not self.governor.get(ts)
                     and time.monotonic() - s.last_active > self.idle_sec]
             for ts in idle:
                 with self.lock:
@@ -3657,6 +4062,7 @@ def main():
                   lambda *a: bridge.term_ev.set())
     restored = bridge.restore_live()
     adopted = bridge.adopt_inflight(skip=restored)
+    limited = bridge.adopt_limited()
     interrupted = mark_interrupted(bridge.tasks_dir,
                                    skip=restored | adopted)
     for ts, st in interrupted:
@@ -3664,17 +4070,20 @@ def main():
         if time.time() - st.get("updated", 0) < 86400:
             bridge.post(ts, "🔄 桥服务已重启，本会话中断；"
                             "回复本线程可自动恢复上下文。")
-    if restored or adopted or interrupted:
+    if restored or adopted or interrupted or limited:
         print(f"[info] startup: {len(restored)} live-restored, "
               f"{len(adopted)} inflight-adopted, "
+              f"{len(limited)} limit-parked, "
               f"{len(interrupted)} interrupted", flush=True)
         # One channel-level line replaces per-thread "会话保持"
         # posts: with N sessions a reload used to cost 2-4 messages
         # per thread.
-        if restored or adopted:
+        if restored or adopted or limited:
             bits = [f"接管 {len(restored)} 个会话"] if restored else []
             if adopted:
                 bits.append(f"{len(adopted)} 个未跑完回合续跑")
+            if limited:
+                bits.append(f"{len(limited)} 个限额回合排队冷却")
             bridge.post(None, "🔄 桥已热重启：" + "，".join(bits) +
                             "，线程里继续即可。")
 
@@ -3693,6 +4102,7 @@ def main():
                 bridge._log_err("interaction", e)
 
     threading.Thread(target=bridge.reaper, daemon=True).start()
+    threading.Thread(target=bridge.limit_sweeper, daemon=True).start()
     socket.socket_mode_request_listeners.append(handle)
     socket.connect()
     print(f"session bridge up in {CHANNEL}, tasks dir {TASKS_DIR}",
