@@ -1689,7 +1689,8 @@ class SessionBridge:
                  pin_add=None, pin_list=None, pin_rm=None, team_url=None,
                  ephemeral=None, bookmarks=None, bookmark_add=None,
                  bookmark_edit=None, permalink=None,
-                 dm_post=None, dm_update=None):
+                 dm_post=None, dm_update=None,
+                 canvas_create=None, canvas_edit=None):
         self.post_msg = post
         self.react_msg = react
         self.unreact_msg = unreact
@@ -1745,6 +1746,10 @@ class SessionBridge:
         # transports that can address a channel other than self.channel.
         self.dm_post = dm_post
         self.dm_update = dm_update
+        # Channel canvas mirror: Slack mobile exposes the channel
+        # canvas as a header icon — persistent doc, never scrolls.
+        self.canvas_create = canvas_create
+        self.canvas_edit = canvas_edit
         bd = self._board_load()
         seed = os.environ.get("BOARD_DM_USERS", "")
         self._dm_users = set(filter(None, seed.split(","))) | \
@@ -4508,6 +4513,7 @@ class SessionBridge:
                     self._board_text = text
                 self._board_bookmark(ts)
             self._dm_sync(text, blocks)
+            self._canvas_sync(text)
         if reply_to:
             self.post(reply_to, "看板已刷新（频道置顶那条 📋）。")
 
@@ -4608,6 +4614,27 @@ class SessionBridge:
                 changed = True
         if changed:
             self._dm_persist()
+
+    def _canvas_sync(self, text):
+        """Mirror the board into the channel canvas — a persistent doc
+        reachable from the channel header on mobile, unlike pins."""
+        if not (self.canvas_create or self.canvas_edit):
+            return
+        md = re.sub(r'<(https?://[^|>]+)\|([^>]+)>',
+                    r'[\2](\1)', text)
+        try:
+            d = self._board_load()
+            cid = d.get("canvas")
+            if not cid and self.canvas_create:
+                cid = self.canvas_create("📋 会话看板", md)
+                if cid:
+                    d["canvas"] = cid
+                    self._board_write(d)
+                    return
+            if cid and self.canvas_edit:
+                self.canvas_edit(cid, md)
+        except Exception as e:
+            self._log_err("canvas sync", e)
 
     def _board_peek(self, sid, who, chan=None):
         """Peek without stealing: the last few transcript actions go
@@ -5122,6 +5149,18 @@ def main():
             kw["blocks"] = blocks
         web.chat_update(**kw)
 
+    def canvas_create(title, md):
+        r = web.conversations_canvases_create(
+            channel_id=CHANNEL, title=title,
+            document_content={"type": "markdown", "markdown": md})
+        return r.get("canvas_id")
+
+    def canvas_edit(cid, md):
+        web.canvases_edit(canvas_id=cid, changes=[{
+            "operation": "replace",
+            "document_content": {"type": "markdown",
+                                 "markdown": md}}])
+
     bridge = SessionBridge(post, own_bot_id=own_bot_id,
                            own_user_id=own_user_id,
                            react=react, unreact=unreact, update=update,
@@ -5133,7 +5172,9 @@ def main():
                            bookmark_add=bookmark_add,
                            bookmark_edit=bookmark_edit,
                            permalink=permalink,
-                           dm_post=dm_post, dm_update=dm_update)
+                           dm_post=dm_post, dm_update=dm_update,
+                           canvas_create=canvas_create,
+                           canvas_edit=canvas_edit)
     signal.signal(signal.SIGHUP,
                   lambda *a: bridge.reload_ev.set())
     signal.signal(signal.SIGTERM,

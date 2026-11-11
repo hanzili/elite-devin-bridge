@@ -1891,6 +1891,7 @@ class InteropTest(unittest.TestCase):
         os.makedirs(self.lock_dir)
         self._pctx = os.environ.get("PCTX_MESSAGES_PUT")
         os.environ["PCTX_MESSAGES_PUT"] = ""
+        self._dmseed = os.environ.pop("BOARD_DM_USERS", None)
         db = sqlite3.connect(self.db_path)
         db.execute("CREATE TABLE sessions(id TEXT PRIMARY KEY,"
                    " working_directory TEXT, backend_type TEXT,"
@@ -1924,6 +1925,8 @@ class InteropTest(unittest.TestCase):
             os.environ.pop("PCTX_MESSAGES_PUT", None)
         else:
             os.environ["PCTX_MESSAGES_PUT"] = self._pctx
+        if self._dmseed is not None:
+            os.environ["BOARD_DM_USERS"] = self._dmseed
 
     def make_pins_bridge(self, **kw):
         pinned = []
@@ -2312,6 +2315,29 @@ class InteropTest(unittest.TestCase):
         b2, _ = self._dm_bridge(tasks_dir=td)
         self.assertIn("U9", b2._dm_users)
         self.assertEqual(b2._dm_boards["U9"]["channel"], "DU9")
+
+    def test_canvas_mirror_created_then_edited(self):
+        """First refresh creates the channel canvas (id persisted);
+        later refreshes edit it in place with link-friendly markdown."""
+        made, edits = [], []
+
+        def mk(title, md):
+            made.append(md)
+            return "FC1"
+
+        b, web = make_bridge(
+            canvas_create=mk,
+            canvas_edit=lambda cid, md: edits.append((cid, md)))
+        b._board_render = lambda: (
+            "🔥 *t* — `s` <https://x.y/p1|进去聊>", [])
+        b._board_refresh(manual=True)
+        self.assertEqual(len(made), 1)
+        self.assertIn("[进去聊](https://x.y/p1)", made[0])  # mrkdwn→md
+        b._board_text = "stale"
+        b._board_refresh(manual=True)
+        self.assertEqual(len(made), 1)  # never a second canvas
+        self.assertEqual(edits[-1][0], "FC1")
+        self.assertIn("[进去聊](https://x.y/p1)", edits[-1][1])
 
 
 class SendablesTest(unittest.TestCase):
