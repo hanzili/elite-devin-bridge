@@ -2268,10 +2268,11 @@ class SendablesTest(unittest.TestCase):
                             files["export.xlsx"]: True})
         b, _ = make_bridge()
         # reply names report.md by basename only
-        got = b._collect_sendables(s, "已生成 report.md", since)
+        got, pending, _ = b._collect_sendables(s, "已生成 report.md",
+                                               since)
         names = {os.path.basename(p) for p in got}
         self.assertIn("report.md", names)    # basename mention
-        self.assertIn("export.xlsx", names)  # touched + deliverable
+        self.assertIn("export.xlsx", names)  # fresh deliverable
         self.assertIn("chart.png", names)    # fresh media in workdir
         self.assertNotIn("main.py", names)   # code edit → not spam
         self.assertNotIn("old.md", names)    # stale file → not sent
@@ -2286,10 +2287,137 @@ class SendablesTest(unittest.TestCase):
             f.write("print(1)")
         s = self._sess(wd, {p: True})
         b, _ = make_bridge()
-        got = b._collect_sendables(s, "改动都在 main.py 里", since)
+        got, _, _ = b._collect_sendables(s, "改动都在 main.py 里",
+                                         since)
         self.assertIn(os.path.realpath(p),
                       {os.path.realpath(x) for x in got})
 
+    def test_touched_alone_never_ships(self):
+        """Reading/editing a working file is not a deliverable: a
+        touched file that isn't named in the reply and isn't a fresh
+        deliverable under the workdir stays out of the upload set —
+        the old rule spammed README.md/GOAL.md edits into threads."""
+        wd = tempfile.mkdtemp()
+        since = time.time() - 60
+        outside = os.path.join(tempfile.mkdtemp(), "notes.md")
+        with open(outside, "w") as f:
+            f.write("x")
+        s = self._sess(wd, {outside: True})
+        b, _ = make_bridge()
+        got, pending, _ = b._collect_sendables(s, "看了一下", since)
+        self.assertEqual(got, [])
+        self.assertEqual(pending, [])
+
+    def test_internal_and_workfiles_not_auto_sent(self):
+        """.bridge_state.json / memory.md / README.md must never
+        auto-upload even when fresh — they're bridge/agent internals
+        or project working files."""
+        wd = tempfile.mkdtemp()
+        since = time.time() - 60
+        for n in (".bridge_state.json", "memory.md", "README.md",
+                  "GOAL.md", ".devin-goal"):
+            with open(os.path.join(wd, n), "w") as f:
+                f.write("x")
+        s = self._sess(wd, {})
+        b, _ = make_bridge()
+        got, pending, _ = b._collect_sendables(s, "done", since)
+        self.assertEqual(got + pending, [])
+        # …but naming one outright still ships it (intent beats rules)
+        got, _, _ = b._collect_sendables(s, "看 README.md", since)
+        self.assertIn("README.md", {os.path.basename(p)
+                                    for p in got})
+
+    def test_auto_send_dedupes_and_caps(self):
+        """Same path never auto-sends twice (shelf-radar triple-send
+        regression), and a big batch caps at AUTO_SEND_MAX with the
+        rest pooling into pending for `!files`."""
+        wd = tempfile.mkdtemp()
+        since = time.time() - 60
+        paths = []
+        for i in range(6):
+            p = os.path.join(wd, f"demo-{i}.png")
+            with open(p, "w") as f:
+                f.write("x")
+            paths.append(p)
+        s = self._sess(wd, {})
+        s.sent_files = {}
+        b, _ = make_bridge()
+        send1, pend1, mt1 = b._collect_sendables(s, "ok", since)
+        s.sent_files.update(mt1)
+        s.pending_files = list(pend1)
+        self.assertEqual(len(send1), sb.AUTO_SEND_MAX)
+        self.assertEqual(len(pend1), 6 - sb.AUTO_SEND_MAX)
+        # turn 2: sent + pooled files → nothing resends
+        send2, pend2, _ = b._collect_sendables(s, "again", since)
+        self.assertEqual(send2, [])
+        self.assertEqual(pend2, [])
+
+    def test_named_resend_only_when_changed(self):
+        wd = tempfile.mkdtemp()
+        since = time.time() - 60
+        p = os.path.join(wd, "r.md")
+        with open(p, "w") as f:
+            f.write("a")
+        s = self._sess(wd, {})
+        s.sent_files = {}
+        b, _ = make_bridge()
+        send, _, mt = b._collect_sendables(s, "改在 r.md", since)
+        s.sent_files.update(mt)
+        send2, _, _ = b._collect_sendables(s, "还是 r.md", since)
+        self.assertEqual(send2, [])
+        time.sleep(0.02)
+        with open(p, "w") as f:
+            f.write("bb")
+        send3, _, _ = b._collect_sendables(s, "最新 r.md", since)
+        self.assertEqual([os.path.basename(x) for x in send3],
+                         ["r.md"])
+
+
+
+    def test_files_and_send_commands(self):
+        """!files lists deliverables with state marks; !send pulls by
+        name; !send all drains the pending pool."""
+        import types
+        wd = tempfile.mkdtemp()
+        for n in ("a.png", "b.png", "c.png"):
+            with open(os.path.join(wd, n), "w") as f:
+                f.write("x")
+        ups = []
+        b, web = make_bridge(
+            upload=lambda ts, p: ups.append((ts, p)))
+        pend = os.path.join(wd, "a.png")
+        s = types.SimpleNamespace(
+            workdir=wd, touched={},
+            sent_files={}, pending_files=[pend])
+        b.sessions["f.1"] = s
+        b._files_list("f.1")
+        self.assertTrue(any("a.png" in t and "（未发）" in t
+                            for _, t in web.posts))
+        self.assertTrue(any("b.png" in t for _, t in web.posts))
+        b._send_named("f.1", "a.png")
+        self.assertEqual([os.path.basename(p) for _, p in ups],
+                         ["a.png"])
+        self.assertEqual(s.pending_files, [])
+        s.pending_files = [os.path.join(wd, "b.png"),
+                           os.path.join(wd, "c.png")]
+        b._send_named("f.1", "all")
+        self.assertEqual({os.path.basename(p) for _, p in ups},
+                         {"a.png", "b.png", "c.png"})
+        self.assertEqual(s.pending_files, [])
+
+    def test_board_ephemeral_to_requester(self):
+        """!board pops a private snapshot for the requester instead of
+        making them scroll to the pin."""
+        shots = []
+        b, web = make_bridge(
+            ephemeral=lambda **kw: shots.append(kw))
+        b._board_render = lambda: ("BOARDTEXT", [])
+        b._board_refresh = lambda **kw: None
+        b._bang("rt.1", "board", "", {"user": "U42"})
+        self.assertEqual(len(shots), 1)
+        self.assertEqual(shots[0]["user"], "U42")
+        self.assertEqual(shots[0]["text"], "BOARDTEXT")
+        self.assertEqual(shots[0]["channel"], CHANNEL)
 
 
 class WireRobustnessTest(unittest.TestCase):

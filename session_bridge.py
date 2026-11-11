@@ -343,6 +343,16 @@ SEND_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".mp4", ".mov",
             ".xlsx", ".xls", ".docx", ".doc", ".pptx",
             ".html", ".htm", ".ipynb", ".json",
             ".zip", ".tar", ".gz", ".sql"}
+# Auto-send budget per turn: beyond this, files pool into `!files`.
+AUTO_SEND_MAX = 3
+# Never uploaded even when named — bridge/agent internal state.
+INTERNAL_FILE_RE = re.compile(
+    r"(^|/)\.[^/]+$|(^|/)(memory\.md|\.devin-goal[^/]*)$", re.I)
+# Working files that are almost never the deliverable — skipped by
+# auto-send but still sent when the reply names them.
+WORKFILE_NAMES = {"readme", "skill", "agents", "claude", "goal",
+                  "todo", "changelog", "contributing", "data",
+                  "license", "license.md", "notes", "summary"}
 MAX_UPLOAD_BYTES = 200 * 1024 * 1024
 GOAL_POLL_SEC = float(os.environ.get("BRIDGE_GOAL_POLL_SEC", "8"))
 GOAL_WATCH_SEC = float(os.environ.get("BRIDGE_GOAL_WATCH_SEC", "3"))
@@ -446,6 +456,8 @@ BANG_CMDS = {
     "release": "release", "detach": "release",
     "peek": "peek", "look": "peek", "看看": "peek",
     "board": "board", "看板": "board",
+    "files": "files", "ls-files": "files", "文件": "files",
+    "send": "send", "get": "send", "发": "send",
     "pad": "pad", "remote": "pad", "遥控": "pad",
     "shot": "shot", "ss": "shot", "screenshot": "shot", "截图": "shot",
     "type": "type", "输入": "type",
@@ -468,7 +480,9 @@ HELP_CARD = """*桥命令*（`!` 开头是命令，不带 `!` 就是聊天）
 • `!release` — 桥松开本线程会话（上下文保留，随时可再接回）
 • `!limits` — 限额冷却队列（哪些回合在等重试、何时自动续跑）
 • `!peek [会话id]` — 只看不动：最近几条动态（不接管不抢锁）
-• `!board` — 刷新频道顶部钉住的会话看板
+• `!board` — 原地弹一份即时看板（只你可见）；频道名下面书签直达置顶看板
+• `!files` — 本线程可取的产出文件清单
+• `!send <名字|all>` — 拉取文件：单个指名或全部待发
 • `!pad` — 手机遥控入口：web 控制台/RDP/KDE Connect 连接卡
 • `!type <文字>` — 打进电脑当前窗口（中文自动走剪贴板）
 • `!key <组合>` — 给电脑按键，如 `!key ctrl+alt+t`、`!key enter`
@@ -1036,6 +1050,8 @@ class DevinSession:
         self.recent = deque(maxlen=8)
         self.tool_count = 0
         self.touched = {}
+        self.sent_files = {}     # path -> mtime of last upload
+        self.pending_files = []  # pooled for !files / !send
         self.turn_started = 0.0
         self.plan_entries = []
         self.goal = None
@@ -1671,7 +1687,8 @@ class SessionBridge:
                  channel=CHANNEL, react=None, unreact=None, update=None,
                  upload=None, status=None, open_modal=None,
                  pin_add=None, pin_list=None, pin_rm=None, team_url=None,
-                 ephemeral=None):
+                 ephemeral=None, bookmarks=None, bookmark_add=None,
+                 bookmark_edit=None, permalink=None):
         self.post_msg = post
         self.react_msg = react
         self.unreact_msg = unreact
@@ -1683,6 +1700,11 @@ class SessionBridge:
         self.pin_list = pin_list
         self.pin_rm = pin_rm
         self.ephemeral_msg = ephemeral
+        self.bookmarks = bookmarks
+        self.bookmark_add = bookmark_add
+        self.bookmark_edit = bookmark_edit
+        self.permalink = permalink
+        self._board_bookmarked = None
         self.team_url = (team_url or "").rstrip("/")
         self._board_at = 0.0
         self._board_lock = threading.Lock()
@@ -2931,17 +2953,20 @@ class SessionBridge:
         return out
 
     def _collect_sendables(self, s, reply, since):
-        """Files to push into the thread:
-        - absolute paths named in the reply (any type — naming a path
-          is intent)
-        - basenames named in the reply, resolved against files the
-          session touched or created under the workdir this turn
-        - tool-call locations (`s.touched`) written this turn whose
-          type is a deliverable (report/data/doc — not code edits)
-        - new deliverable files written under the workdir this turn
+        """(send_now, pending): what goes into the thread vs. pools for
+        `!files`/`!send`.
+
+        *named* — the reply mentions an absolute path or basename;
+        that's intent, always sent (any type). *auto* — new files
+        with a deliverable extension written under the workdir this
+        turn, minus working/internal files, deduped per path for the
+        life of the session, capped at AUTO_SEND_MAX per turn; the
+        rest pool into `pending`.
         """
-        found = []
-        workdir = s.workdir
+        sent = getattr(s, "sent_files", None)
+        if sent is None:
+            sent = s.sent_files = {}
+        named, auto = [], []
 
         def ok(p):
             try:
@@ -2956,55 +2981,91 @@ class SessionBridge:
             except OSError:
                 return False
 
+        def internal(p):
+            return bool(INTERNAL_FILE_RE.search(p))
+
         for m in re.findall(r"(/[^\s\"'`<>\[\]{}()|]+)", reply or ""):
             p = m.rstrip(".,;:，。；：）)")
-            if ok(p):
-                found.append(os.path.realpath(p))
-        # Basename mentions: '已生成 report.md' without a path still
-        # means the user should get the file — resolve against this
-        # turn's touched set and files under the workdir.
-        mentioned = set(re.findall(
-            r"[\w.\\/-]*[\w-]+\.[A-Za-z0-9]{1,6}", reply or ""))
-        mentioned = {os.path.basename(m) for m in mentioned
-                     if os.path.basename(m)}
+            if ok(p) and not internal(p):
+                named.append(os.path.realpath(p))
+        mentioned = {os.path.basename(m) for m in re.findall(
+            r"[\w.\\/-]*[\w-]+\.[A-Za-z0-9]{1,6}", reply or "")
+            if os.path.basename(m)}
+        # Basename mentions resolve against anything the session
+        # touched — but touching alone never ships a file.
         for p in s.touched:
             base = os.path.basename(p)
-            if base in mentioned and ok(p):
-                found.append(os.path.realpath(p))
-            elif fresh(p) and \
-                    os.path.splitext(base)[1].lower() in SEND_EXT \
-                    and ok(p):
-                found.append(os.path.realpath(p))
+            if base in mentioned and ok(p) and not internal(p):
+                named.append(os.path.realpath(p))
+
         skip_dirs = {"inbox", "node_modules", "__pycache__", "dist",
                      ".git", ".venv", "venv"}
-        for dirpath, dirs, names in os.walk(workdir):
+        named_set = set(named)
+        for dirpath, dirs, names in os.walk(s.workdir):
             dirs[:] = [d for d in dirs if not d.startswith(".")
                        and d not in skip_dirs]
             for n in names:
-                if n.startswith(".") or n == "AGENTS.md":
-                    continue
-                ext = os.path.splitext(n)[1].lower()
-                if ext not in SEND_EXT and n not in mentioned:
-                    continue
                 p = os.path.join(dirpath, n)
-                if ok(p) and fresh(p):
-                    found.append(os.path.realpath(p))
-        seen, out = set(), []
-        for p in found:
-            if p not in seen:
-                seen.add(p)
-                out.append(p)
-            if len(out) >= 10:
-                break
-        return out
+                if not ok(p) or not fresh(p) or internal(p):
+                    continue
+                rp = os.path.realpath(p)
+                if rp in named_set:
+                    continue
+                if n in mentioned:
+                    named.append(rp)
+                    named_set.add(rp)
+                    continue
+                stem = os.path.splitext(n)[0].lower()
+                if n.startswith(".") or \
+                        os.path.splitext(n)[1].lower() not in SEND_EXT \
+                        or stem in WORKFILE_NAMES:
+                    continue
+                auto.append(rp)
+
+        send_now, pending = [], []
+        seen = set()
+        pooled = {os.path.realpath(p) for p in
+                  getattr(s, "pending_files", [])}
+        for p in named:
+            if p in seen:
+                continue
+            seen.add(p)
+            try:
+                mt = os.path.getmtime(p)
+            except OSError:
+                continue
+            # Named re-sends only when the file actually changed —
+            # pointing at the same untouched file twice isn't a new
+            # upload.
+            if sent.get(p) == mt:
+                continue
+            send_now.append((p, mt))
+        for p in auto:
+            if p in sent or p in seen or p in pooled:
+                continue  # one auto-send per path per session;
+                          # pooled files wait for `!send`
+            if len(send_now) >= AUTO_SEND_MAX:
+                pending.append(p)
+                continue
+            try:
+                mt = os.path.getmtime(p)
+            except OSError:
+                continue
+            seen.add(p)
+            send_now.append((p, mt))
+        return [p for p, _ in send_now], pending, \
+            {p: mt for p, mt in send_now}
 
     def _send_files(self, ts, s, reply, since):
         if not self.upload_msg:
             return
-        for p in self._collect_sendables(s, reply, since):
+        send_now, pending, sent_new = self._collect_sendables(
+            s, reply, since)
+        for p in send_now:
             for attempt in range(3):
                 try:
                     self.upload_msg(ts, p)
+                    s.sent_files[p] = sent_new[p]
                     break
                 except Exception as e:
                     # Transport failures (timeout, dropped connection)
@@ -3018,6 +3079,127 @@ class SessionBridge:
                                   f"{os.path.basename(p)} "
                                   f"({_errname(e)})，路径: {p}")
                     break
+        if pending:
+            s.pending_files = list(
+                dict.fromkeys(getattr(s, "pending_files", [])
+                              + pending))
+            names = ", ".join(f"`{os.path.basename(p)}`"
+                              for p in pending[:4])
+            more = (f" 等{len(pending)}个" if len(pending) > 4 else "")
+            self.post(ts, f"📁 还有新文件没发：{names}{more} — "
+                          "`!files` 看全部，`!send <名字>` 或 "
+                          "`!send all` 拉取。")
+
+    _SKIP_DIRS = ("inbox", "node_modules", "__pycache__", "dist",
+                  ".git", ".venv", "venv")
+
+    def _deliverables_walk(self, wd):
+        """Uploadable deliverables under the workdir, mtime-desc."""
+        out = []
+        for dirpath, dirs, names in os.walk(wd):
+            dirs[:] = [d for d in dirs if not d.startswith(".")
+                       and d not in self._SKIP_DIRS]
+            for n in names:
+                p = os.path.join(dirpath, n)
+                if INTERNAL_FILE_RE.search(p) or \
+                        os.path.splitext(n)[1].lower() not in SEND_EXT:
+                    continue
+                try:
+                    if 0 < os.path.getsize(p) <= MAX_UPLOAD_BYTES:
+                        out.append((os.path.getmtime(p), p))
+                except OSError:
+                    pass
+        return [p for _, p in sorted(out, reverse=True)]
+
+    def _files_list(self, root):
+        """!files — what this thread can pull, marked by state."""
+        s = self.sessions.get(root)
+        wd = getattr(s, "workdir", None) or self._workdir(root)
+        sent = getattr(s, "sent_files", {}) if s else {}
+        pend = {os.path.realpath(p) for p in
+                getattr(s, "pending_files", [])
+                if os.path.isfile(p)} if s else set()
+        lines = ["📁 *本线程可取的文件*"]
+        shown = 0
+        seen = set()
+        for p in sorted(pend, key=lambda p: -os.path.getmtime(p)) + \
+                self._deliverables_walk(wd):
+            rp = os.path.realpath(p)
+            if rp in seen:
+                continue
+            seen.add(rp)
+            mark = "（未发）" if rp in pend else \
+                   ("（已发过）" if rp in sent else "")
+            lines.append(f"• `{os.path.basename(p)}`{mark}")
+            shown += 1
+            if shown >= 15:
+                lines.append("• …")
+                break
+        if not shown:
+            lines.append("（还没有产出文件）")
+        lines.append("发 `!send <名字>` 拉单个，`!send all` 全拉。")
+        self.post(root, "\n".join(lines))
+
+    def _send_named(self, root, arg):
+        """!send <名|路径|all> — pull files on demand."""
+        s = self.sessions.get(root)
+        name = (arg or "").strip().strip("`").strip('"').strip("'")
+        if not name:
+            self.post(root, "用法：`!send <文件名|路径>` 或 `!send all`"
+                            "（`!files` 先看有什么）。")
+            return
+        if name.lower() == "all":
+            if s is None:
+                self.post(root, "没有待发文件。")
+                return
+            pend = [p for p in s.pending_files if os.path.isfile(p)]
+            if not pend:
+                self.post(root, "没有待发文件。")
+                return
+            ok_ = 0
+            for p in pend:
+                try:
+                    self.upload_msg(root, p)
+                    s.sent_files[p] = os.path.getmtime(p)
+                    ok_ += 1
+                except Exception as e:
+                    self._log_err(f"upload {p}", e)
+            s.pending_files = [p for p in s.pending_files
+                               if p not in pend]
+            self.post(root, f"📎 已发 {ok_}/{len(pend)} 个文件。")
+            return
+        cands = []
+        if os.path.isabs(name) and os.path.isfile(name):
+            cands = [name]
+        else:
+            wd = getattr(s, "workdir", None) or self._workdir(root)
+            for pool in (getattr(s, "pending_files", []) if s else [],
+                         list(getattr(s, "touched", {})) if s else []):
+                cands += [p for p in pool
+                          if os.path.basename(p) == name
+                          and os.path.isfile(p)]
+            if not cands:
+                for dirpath, dirs, names in os.walk(wd):
+                    dirs[:] = [d for d in dirs
+                               if not d.startswith(".")
+                               and d not in self._SKIP_DIRS]
+                    cands += [os.path.join(dirpath, n) for n in names
+                              if n == name]
+        if not cands:
+            self.post(root, f"没找到 `{name}`——`!files` "
+                            "看可取的文件。")
+            return
+        p = os.path.realpath(cands[0])
+        try:
+            self.upload_msg(root, p)
+            if s is not None:
+                s.sent_files[p] = os.path.getmtime(p)
+                s.pending_files = [q for q in s.pending_files
+                                   if os.path.realpath(q) != p]
+        except Exception as e:
+            self._log_err(f"upload {p}", e)
+            self.post(root, f"📎 发 {os.path.basename(p)} 失败"
+                            f"({_errname(e)})。")
 
     def _ledger_user_msg(self, msg_ts, root_ts, text):
         """Record a session-bound user message into the personal-context
@@ -3572,7 +3754,12 @@ class SessionBridge:
         elif cmd == "peek":
             self._peek(root, arg)
         elif cmd == "board":
-            self._board_refresh(manual=True, reply_to=root)
+            self._board_show(root, ev)
+            self._board_refresh(manual=True)
+        elif cmd == "files":
+            self._files_list(root)
+        elif cmd == "send":
+            self._send_named(root, arg)
         elif cmd == "pad":
             self._pad(root)
         elif cmd == "shot":
@@ -4292,6 +4479,7 @@ class SessionBridge:
                                     self._log_err("pin_add", e)
                 if updated or ts:
                     self._board_text = text
+                self._board_bookmark(ts)
         if reply_to:
             self.post(reply_to, "看板已刷新（频道置顶那条 📋）。")
 
@@ -4312,6 +4500,43 @@ class SessionBridge:
             None, f"📥 接管 `{sid}` —— {_first_line(row.get('title'), 40)}")
         if anchor:
             self._adopt(anchor, sid)
+
+    def _board_show(self, root, ev):
+        """!board — an ephemeral snapshot right where the user typed;
+        no scrolling to the pin. The pinned board still refreshes
+        via _board_refresh alongside."""
+        who = (ev or {}).get("user")
+        if self.ephemeral_msg and who:
+            text, blocks = self._board_render()
+            try:
+                self.ephemeral_msg(channel=self.channel, user=who,
+                                   text=text, blocks=blocks)
+                return
+            except Exception as e:
+                self._log_err("board ephemeral", e)
+        self.post(root, "看板在频道置顶那条 📋——频道名下面的"
+                        "「会话看板」书签可以直达。")
+
+    def _board_bookmark(self, ts):
+        """Keep a channel header bookmark aimed at the pinned board —
+        one tap on mobile instead of hunting the pins list."""
+        if not (self.bookmarks and self.bookmark_add
+                and self.permalink and ts):
+            return
+        if getattr(self, "_board_bookmarked", None) == ts:
+            return
+        try:
+            link = self.permalink(ts)
+            hit = next((b for b in self.bookmarks()
+                        if "看板" in (b.get("title") or "")), None)
+            if hit and hit.get("link") != link \
+                    and self.bookmark_edit:
+                self.bookmark_edit(hit["id"], link)
+            elif not hit:
+                self.bookmark_add("📋 会话看板", link)
+            self._board_bookmarked = ts
+        except Exception as e:
+            self._log_err("board bookmark", e)
 
     def _board_peek(self, sid, who):
         """Peek without stealing: the last few transcript actions go
@@ -4796,6 +5021,22 @@ def main():
     def ephemeral(**kw):
         web.chat_postEphemeral(**kw)
 
+    def permalink(ts):
+        return web.chat_getPermalink(channel=CHANNEL,
+                                     message_ts=ts).get("permalink")
+
+    def bookmarks():
+        return web.bookmarks_list(channel_id=CHANNEL) \
+            .get("bookmarks") or []
+
+    def bookmark_add(title, link):
+        web.bookmarks_add(channel_id=CHANNEL, title=title, link=link,
+                          type="link")
+
+    def bookmark_edit(bid, link):
+        web.bookmarks_edit(bookmark_id=bid, channel_id=CHANNEL,
+                           link=link)
+
     bridge = SessionBridge(post, own_bot_id=own_bot_id,
                            own_user_id=own_user_id,
                            react=react, unreact=unreact, update=update,
@@ -4803,7 +5044,10 @@ def main():
                            open_modal=open_modal,
                            pin_add=pin_add, pin_list=pin_list,
                            pin_rm=pin_rm, team_url=auth.get("url"),
-                           ephemeral=ephemeral)
+                           ephemeral=ephemeral, bookmarks=bookmarks,
+                           bookmark_add=bookmark_add,
+                           bookmark_edit=bookmark_edit,
+                           permalink=permalink)
     signal.signal(signal.SIGHUP,
                   lambda *a: bridge.reload_ev.set())
     signal.signal(signal.SIGTERM,
