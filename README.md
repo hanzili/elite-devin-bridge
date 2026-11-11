@@ -1,5 +1,7 @@
 # Elite Devin Bridge
 
+**English** | [中文](README.zh-CN.md)
+
 A Slack ↔ `devin acp` session bridge that makes a coding agent feel like a
 native Slack teammate instead of a command relay.
 
@@ -21,8 +23,8 @@ ask for permission — is handled by the bridge, not by prompting the model.
   🛑 stopped / 💥 crashed / ⏰ timeout / 🔄 reload.
 - **Controls** — `🛑 停止` / `📋 状态` buttons on the status card, plus
   `!stop`, `!status`, `!queue`, `!reload`, `!reset`, `!help`, `!allow`,
-  `!deny`, `!approvals` text commands. Unknown `!x` is forwarded to the
-  agent as a slash command.
+  `!deny`, `!approvals`, `!peek`, `!files`, `!send`, `!board` text
+  commands. Unknown `!x` is forwarded to the agent as a slash command.
 - **Interactive approvals** — Block Kit card with one button per option,
   a "reject with note" modal, a persistent per-thread approval ledger,
   and stale/expired guards. Pending approvals park the turn (exempt from
@@ -63,6 +65,30 @@ ask for permission — is handled by the bridge, not by prompting the model.
   (`!board`, auto-refreshed on session lifecycle) gives a stable
   overview — updates happen inside threads, so active sessions never
   re-order the channel.
+- **Dashboard, three surfaces** — the same live board is pinned in the
+  channel, mirrored into each user's bot DM (`BOARD_DM_USERS` seed +
+  auto-learn anyone who interacts), and rendered into the channel
+  canvas. 🔥 rows show the actual current action (not just "active"),
+  every row offers 看看 (peek without stealing) and 接管 (adopt into a
+  fresh thread — one tap, no typing), and a dropdown takes over any
+  session. Mobile-friendly: no scrolling to a pin.
+- **Talking interrupts** — a message that arrives mid-turn interrupts
+  the turn (`⏸ 已打断`, session/cancel under the hood) and runs next;
+  it never waits for the current output to finish. Distinct from
+  `!stop` (🛑).
+- **Intent-gated file delivery** — files the agent explicitly names in
+  its reply always upload; fresh deliverables in the workdir auto-send
+  capped at 3 per turn (README/GOAL/working files and internal state
+  never do). Overflow goes to a pending pool: `!files` lists what
+  exists, `!send <name>` / `!send all` pulls it on demand. Uploads
+  retry on transient failure with a 300s budget.
+- **Host vitals + self-maintenance** — a `🖥 CPU · 内存 · 磁盘 · ⬇⬆`
+  line on the board reads /proc directly; a metric sustained over
+  `VITAL_*_WARN` spawns a 🧹 cleanup session (bounded safe frees:
+  apt/journal/tmp/docker prune — never user data), and every
+  `AUDIT_INTERVAL` (12h) a 🩺 self-audit session reviews bridge
+  logs/state/Slack surfaces against an injected health digest and
+  fixes what's safely fixable.
 - **Goal runs** — `/goal` in a thread attaches a long-running objective
   with periodic resumption (`!goal cancel` / 取消目标 to clear).
 
