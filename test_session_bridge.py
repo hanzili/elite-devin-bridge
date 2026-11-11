@@ -1221,15 +1221,33 @@ class PermButtonTest(unittest.TestCase):
         b.sessions["pu.1"].terminate()
 
 
-    def test_queue_notice_when_busy(self):
+    def test_user_reply_interrupts_running_turn(self):
+        """Speaking while it works = interrupt, not queue: the running
+        turn is cancelled and the new message runs next."""
         b, web = make_bridge(timeout=60)
         b.handle_event(root_ev("q.1", "<@BTEST> slow"), "EvQ1")
         s = wait_running(b, "q.1")
         self.assertIsNotNone(s)
         b.handle_event(reply_ev("q.1", "q.2", "可以先回我话么"), "EvQ2")
-        self.assertTrue(web.wait_for("已排队"))
-        b.handle_event(reply_ev("q.1", "q.3", "!stop"), "EvQ3")
-        self.assertTrue(web.wait_for("已停止", 10))
+        # turn settles as interrupted, then the new message runs
+        self.assertTrue(web.wait_for("已打断", 15))
+        self.assertTrue(web.wait_for("任务结果", 15))
+        b.sessions["q.1"].terminate()
+
+    def test_interrupt_ev_cleared_at_acquire(self):
+        """An interrupt signalled after the turn already ended must
+        NOT cancel the next prompt — it's consumed at lock acquire."""
+        b, web = make_bridge()
+        b.handle_event(root_ev("iq.1", "<@BTEST> go"), "EvIQ")
+        self.assertTrue(web.wait_for("任务结果", 15))
+        s = b.sessions["iq.1"]
+        s.interrupt_ev.set()          # stale: nothing running now
+        b.handle_event(reply_ev("iq.1", "iq.2", "再来"), "EvIQ2")
+        self.assertTrue(web.wait_for("任务结果", 15))
+        # the second prompt completed normally, not 'cancelled'
+        s2 = b.sessions["iq.1"]
+        self.assertFalse(s2.interrupted_turn)
+        s2.terminate()
 
     def test_queue_notice_silent_when_idle(self):
         b, web = make_bridge()
@@ -2221,6 +2239,56 @@ class InteropTest(unittest.TestCase):
         b.handle_event(reply_ev("pb.1", "pb.3", "!peek"), "EvPB3")
         self.assertTrue(web.wait_for("收到: hello desk", 10))
         b.sessions["pb.1"].terminate()
+
+
+class SendablesTest(unittest.TestCase):
+    """_collect_sendables: the reply rarely carries absolute paths —
+    deliverables must also be caught via tool-call locations and
+    basename mentions, not just media files in the workdir."""
+
+    def _sess(self, wd, touched):
+        import types
+        return types.SimpleNamespace(workdir=wd, touched=touched)
+
+    def test_deliverable_types_and_basename_mentions(self):
+        wd = tempfile.mkdtemp()
+        since = time.time() - 60
+        now = time.time()
+        files = {}
+        for name in ("report.md", "export.xlsx", "chart.png",
+                     "main.py", "old.md"):
+            p = os.path.join(wd, name)
+            with open(p, "w") as f:
+                f.write("data")
+            files[name] = p
+        os.utime(files["old.md"], (now - 7200, now - 7200))  # stale
+        # main.py was tool-touched this turn but is code — excluded
+        # unless explicitly named
+        s = self._sess(wd, {files["main.py"]: True,
+                            files["export.xlsx"]: True})
+        b, _ = make_bridge()
+        # reply names report.md by basename only
+        got = b._collect_sendables(s, "已生成 report.md", since)
+        names = {os.path.basename(p) for p in got}
+        self.assertIn("report.md", names)    # basename mention
+        self.assertIn("export.xlsx", names)  # touched + deliverable
+        self.assertIn("chart.png", names)    # fresh media in workdir
+        self.assertNotIn("main.py", names)   # code edit → not spam
+        self.assertNotIn("old.md", names)    # stale file → not sent
+
+    def test_code_file_named_in_reply_is_sent(self):
+        """Naming a file outright = intent: '改动在 main.py' uploads it
+        even though code files aren't auto-collected."""
+        wd = tempfile.mkdtemp()
+        since = time.time() - 60
+        p = os.path.join(wd, "main.py")
+        with open(p, "w") as f:
+            f.write("print(1)")
+        s = self._sess(wd, {p: True})
+        b, _ = make_bridge()
+        got = b._collect_sendables(s, "改动都在 main.py 里", since)
+        self.assertIn(os.path.realpath(p),
+                      {os.path.realpath(x) for x in got})
 
 
 

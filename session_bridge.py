@@ -264,6 +264,48 @@ def _one_line(s, n=60):
     return re.sub(r"\s+", " ", (s or "")).strip()[:n]
 
 
+# remote-pad lives outside the bridge: inputctl injects keys/pointer via
+# ydotoold, screengrab pulls a frame through the ScreenCast portal.
+PAD_TOKEN = os.path.expanduser("~/.config/remote-pad/token")
+PAD_DIR = os.path.expanduser("~/remote-pad")
+INPUTCTL = os.path.join(PAD_DIR, "inputctl.py")
+SCREENGRAB = os.path.join(PAD_DIR, "screengrab.py")
+
+
+def _open_capped_append(path, cap=512 * 1024):
+    """Append-mode writer that keeps the log under ~cap bytes by
+    dropping the oldest half on open (acp stderr is chatty)."""
+    try:
+        if os.path.getsize(path) > cap:
+            with open(path, "rb") as f:
+                f.seek(-cap // 2, os.SEEK_END)
+                keep = f.read()
+            with open(path, "wb") as f:
+                f.write(b"--- log truncated ---\n" + keep)
+    except OSError:
+        pass
+    return open(path, "ab", buffering=0)
+
+
+def _stderr_hint(workdir):
+    """Last ERROR/WARN line in the session's acp stderr log, cleaned
+    for Slack ('' when nothing useful is there)."""
+    path = os.path.join(workdir, ".acp_stderr.log")
+    try:
+        with open(path, "rb") as f:
+            if os.path.getsize(path) > 16384:
+                f.seek(-16384, os.SEEK_END)
+            tail = f.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+    lines = [l for l in tail.splitlines()
+             if " ERROR " in l or " WARN " in l]
+    if not lines:
+        return ""
+    m = re.search(r"(?:ERROR|WARN)\s+(.*)", lines[-1])
+    return _one_line(m.group(1), 140) if m else ""
+
+
 def devin_lock_pid(sid):
     """Live PID holding <sid>'s lock file, or None (stale/absent = the
     session is free to adopt)."""
@@ -291,8 +333,16 @@ MEMORY_FILE = os.environ.get("BRIDGE_MEMORY_FILE",
 # in tests — read lazily so tests can set it after import).
 PCTX_MESSAGES_PUT_DEFAULT = \
     "~/.agents/skills/personal-context-pipeline/scripts/messages.py"
+# Deliverable file types pushed into the thread after a turn. Code
+# files (.py/.ts/…) deliberately excluded — edits to them show up in
+# the 📁 list but aren't spammed as attachments unless the reply
+# names them outright.
 SEND_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".mp4", ".mov",
-            ".pdf", ".svg"}
+            ".mp3", ".wav", ".pdf", ".svg",
+            ".md", ".markdown", ".txt", ".csv", ".tsv",
+            ".xlsx", ".xls", ".docx", ".doc", ".pptx",
+            ".html", ".htm", ".ipynb", ".json",
+            ".zip", ".tar", ".gz", ".sql"}
 MAX_UPLOAD_BYTES = 200 * 1024 * 1024
 GOAL_POLL_SEC = float(os.environ.get("BRIDGE_GOAL_POLL_SEC", "8"))
 GOAL_WATCH_SEC = float(os.environ.get("BRIDGE_GOAL_WATCH_SEC", "3"))
@@ -396,6 +446,10 @@ BANG_CMDS = {
     "release": "release", "detach": "release",
     "peek": "peek", "look": "peek", "看看": "peek",
     "board": "board", "看板": "board",
+    "pad": "pad", "remote": "pad", "遥控": "pad",
+    "shot": "shot", "ss": "shot", "screenshot": "shot", "截图": "shot",
+    "type": "type", "输入": "type",
+    "key": "key", "press": "key", "按键": "key",
 }
 # "!goal <x>" stays a session slash command except these, which the
 # bridge answers itself (goal files + RPC + markers).
@@ -415,6 +469,10 @@ HELP_CARD = """*桥命令*（`!` 开头是命令，不带 `!` 就是聊天）
 • `!limits` — 限额冷却队列（哪些回合在等重试、何时自动续跑）
 • `!peek [会话id]` — 只看不动：最近几条动态（不接管不抢锁）
 • `!board` — 刷新频道顶部钉住的会话看板
+• `!pad` — 手机遥控入口：web 控制台/RDP/KDE Connect 连接卡
+• `!type <文字>` — 打进电脑当前窗口（中文自动走剪贴板）
+• `!key <组合>` — 给电脑按键，如 `!key ctrl+alt+t`、`!key enter`
+• `!shot` — 截一张电脑桌面发上来（首次需在本机点一次共享）
 • `!reload` — 桥服务热重启，在跑的会话不中断
 • `!help` — 本卡片
 其它 `!命令` 原样发给会话（如 `!mode`、`!clear`）。
@@ -911,11 +969,16 @@ class DevinSession:
         exe = shutil.which(cmd[0])
         if not exe:
             raise FileNotFoundError(f"{cmd[0]!r} 不在 PATH")
-        self.proc = subprocess.Popen(
-            cmd, cwd=self.acp_cwd,
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, text=True, bufsize=1,
-            start_new_session=True)
+        errlog = _open_capped_append(
+            os.path.join(workdir, ".acp_stderr.log"))
+        try:
+            self.proc = subprocess.Popen(
+                cmd, cwd=self.acp_cwd,
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=errlog, text=True, bufsize=1,
+                start_new_session=True)
+        finally:
+            errlog.close()
         self._init_state()
         write_state(self.workdir, "starting", "acp 已启动")
 
@@ -955,6 +1018,9 @@ class DevinSession:
         self.queued = 0
         self.running = False
         self.stopping = False
+        self.interrupt_ev = threading.Event()
+        self.interrupted_turn = False
+        self.interrupting = False
         self.active_turn = None
         self.last_queue_notice = 0.0
         self.alive = True
@@ -1429,10 +1495,16 @@ class DevinSession:
         try:
             with self.lock:
                 self.queued -= 1
+                # A stale interrupt (set after the previous turn had
+                # already finished) belongs to nobody — only the turn
+                # that was running when it arrived may honor it.
+                self.interrupt_ev.clear()
                 if stop_flag.is_set() or not self.alive:
                     return ("", "queued_cancelled")
                 self.running = True
                 self.stopping = False
+                self.interrupted_turn = False
+                interrupted = False
                 self.active_turn = rec
                 if inflight_id is None:
                     self.chunks = []
@@ -1445,6 +1517,7 @@ class DevinSession:
                     # (clock, tool count, step trail) reset here.
                     self.turn_started = time.monotonic()
                     self.tool_count = 0
+                    self.touched = {}
                     self.recent.clear()
                     self.plan_entries = []
                     self.last_shown = None
@@ -1481,8 +1554,20 @@ class DevinSession:
                         # not silence — PERM_TIMEOUT's reaper owns it.
                         if now >= deadline and not self.pending_perms:
                             raise PromptTimeout()
-                        if stop_flag.is_set() and cancel_deadline is None:
-                            self.stopping = True
+                        if (stop_flag.is_set()
+                                or self.interrupt_ev.is_set()) and \
+                                cancel_deadline is None:
+                            if self.interrupt_ev.is_set() and \
+                                    not stop_flag.is_set():
+                                # A new user message interrupted this
+                                # turn — return reason 'interrupted'
+                                # so the settle card says 打断 not 停止.
+                                interrupted = True
+                                self.interrupted_turn = True
+                                self.interrupting = True
+                            else:
+                                self.stopping = True
+                            self.interrupt_ev.clear()
                             self._send({
                                 "jsonrpc": "2.0",
                                 "method": "session/cancel",
@@ -1517,11 +1602,14 @@ class DevinSession:
                                 raise AcpError(msg["error"])
                             return ("".join(self.chunks).strip()
                                     or "(无输出)",
-                                    msg["result"].get("stopReason", "?"))
+                                    "interrupted" if interrupted else
+                                    msg["result"].get("stopReason",
+                                                      "?"))
                 finally:
                     self._close_pending("turn_end")
                     self.running = False
                     self.stopping = False
+                    self.interrupting = False
                     self.active_turn = None
                     self.last_active = time.monotonic()
                     self.last_turn_end = time.time()
@@ -1780,7 +1868,8 @@ class SessionBridge:
                 lines.append("📁 " + ", ".join(f"`{n}`" for n in shown)
                              + more)
         else:
-            head = "🛑 停止中" if s.stopping else "⏳ 处理中"
+            head = ("⏸ 打断中" if s.interrupting else
+                    "🛑 停止中" if s.stopping else "⏳ 处理中")
             if s.turn_started:
                 head += " · " + _dur(time.monotonic() - s.turn_started)
             if s.tool_count:
@@ -1991,10 +2080,11 @@ class SessionBridge:
                 seg_start = time.time()
                 reply, reason = s.prompt("/goal resume",
                                          self._progress(ts), flag)
-                if flag.is_set() or reason == "cancelled":
+                if flag.is_set() or reason in ("cancelled",
+                                               "interrupted"):
                     return
                 self._final_reply(ts, s, reply)
-                self._send_files(ts, s.workdir, reply, seg_start)
+                self._send_files(ts, s, reply, seg_start)
         finally:
             s.drive_lock.release()
 
@@ -2840,33 +2930,65 @@ class SessionBridge:
                 out.append(f"[附件 {name} 下载失败: {type(e).__name__}]")
         return out
 
-    def _collect_sendables(self, workdir, reply, since):
-        """Files to push into the thread: absolute paths named in the
-        reply, plus new media written under the workdir this turn."""
+    def _collect_sendables(self, s, reply, since):
+        """Files to push into the thread:
+        - absolute paths named in the reply (any type — naming a path
+          is intent)
+        - basenames named in the reply, resolved against files the
+          session touched or created under the workdir this turn
+        - tool-call locations (`s.touched`) written this turn whose
+          type is a deliverable (report/data/doc — not code edits)
+        - new deliverable files written under the workdir this turn
+        """
         found = []
+        workdir = s.workdir
+
+        def ok(p):
+            try:
+                return os.path.isfile(p) and \
+                    0 < os.path.getsize(p) <= MAX_UPLOAD_BYTES
+            except OSError:
+                return False
+
+        def fresh(p):
+            try:
+                return os.path.getmtime(p) > since
+            except OSError:
+                return False
+
         for m in re.findall(r"(/[^\s\"'`<>\[\]{}()|]+)", reply or ""):
             p = m.rstrip(".,;:，。；：）)")
-            try:
-                if os.path.isfile(p) and \
-                        0 < os.path.getsize(p) <= MAX_UPLOAD_BYTES:
-                    found.append(os.path.realpath(p))
-            except OSError:
-                continue
+            if ok(p):
+                found.append(os.path.realpath(p))
+        # Basename mentions: '已生成 report.md' without a path still
+        # means the user should get the file — resolve against this
+        # turn's touched set and files under the workdir.
+        mentioned = set(re.findall(
+            r"[\w.\\/-]*[\w-]+\.[A-Za-z0-9]{1,6}", reply or ""))
+        mentioned = {os.path.basename(m) for m in mentioned
+                     if os.path.basename(m)}
+        for p in s.touched:
+            base = os.path.basename(p)
+            if base in mentioned and ok(p):
+                found.append(os.path.realpath(p))
+            elif fresh(p) and \
+                    os.path.splitext(base)[1].lower() in SEND_EXT \
+                    and ok(p):
+                found.append(os.path.realpath(p))
+        skip_dirs = {"inbox", "node_modules", "__pycache__", "dist",
+                     ".git", ".venv", "venv"}
         for dirpath, dirs, names in os.walk(workdir):
             dirs[:] = [d for d in dirs if not d.startswith(".")
-                       and d != "inbox"]
+                       and d not in skip_dirs]
             for n in names:
                 if n.startswith(".") or n == "AGENTS.md":
                     continue
-                if os.path.splitext(n)[1].lower() not in SEND_EXT:
+                ext = os.path.splitext(n)[1].lower()
+                if ext not in SEND_EXT and n not in mentioned:
                     continue
                 p = os.path.join(dirpath, n)
-                try:
-                    if os.path.getmtime(p) > since and \
-                            0 < os.path.getsize(p) <= MAX_UPLOAD_BYTES:
-                        found.append(os.path.realpath(p))
-                except OSError:
-                    continue
+                if ok(p) and fresh(p):
+                    found.append(os.path.realpath(p))
         seen, out = set(), []
         for p in found:
             if p not in seen:
@@ -2876,16 +2998,26 @@ class SessionBridge:
                 break
         return out
 
-    def _send_files(self, ts, workdir, reply, since):
+    def _send_files(self, ts, s, reply, since):
         if not self.upload_msg:
             return
-        for p in self._collect_sendables(workdir, reply, since):
-            try:
-                self.upload_msg(ts, p)
-            except Exception as e:
-                self._log_err(f"upload {p}", e)
-                self.post(ts, f"📎 文件发送失败 {os.path.basename(p)} "
-                              f"({_errname(e)})，路径: {p}")
+        for p in self._collect_sendables(s, reply, since):
+            for attempt in range(3):
+                try:
+                    self.upload_msg(ts, p)
+                    break
+                except Exception as e:
+                    # Transport failures (timeout, dropped connection)
+                    # are worth a retry — Slack's upload endpoint is
+                    # flaky under load. API-level errors aren't.
+                    if attempt < 2 and isinstance(e, OSError):
+                        time.sleep(1.5 * (attempt + 1))
+                        continue
+                    self._log_err(f"upload {p}", e)
+                    self.post(ts, f"📎 文件发送失败 "
+                                  f"{os.path.basename(p)} "
+                                  f"({_errname(e)})，路径: {p}")
+                    break
 
     def _ledger_user_msg(self, msg_ts, root_ts, text):
         """Record a session-bound user message into the personal-context
@@ -2969,18 +3101,31 @@ class SessionBridge:
             write_state(s.workdir, "idle", s.last_activity,
                         "任务已取消" if reason in
                         ("cancelled", "queued_cancelled")
+                        else "任务被打断" if reason == "interrupted"
                         else "上一任务已完成")
-            if reason in ("cancelled", "queued_cancelled"):
-                self._finish(ts, s, "octagonal_sign", "🛑 已停止")
+            if reason in ("cancelled", "queued_cancelled",
+                          "interrupted"):
+                interrupted = reason == "interrupted"
+                if interrupted:
+                    self._finish(ts, s, "double_vertical_bar",
+                                 "⏸ 已打断")
+                else:
+                    self._finish(ts, s, "octagonal_sign", "🛑 已停止")
                 self._post_think(ts, s)
+                # Work produced before the cut-off still belongs in
+                # the thread — send files on interrupted turns too.
+                self._send_files(ts, s, reply, turn_start)
                 if reason == "queued_cancelled":
                     self.post(ts, "（排队中已取消）")
+                elif interrupted:
+                    self.post(ts, (reply + "\n" if reply else "")
+                              + "（已打断，接着处理新消息）")
                 else:
                     self.post(ts, (reply + "\n" if reply else "")
                               + "（已停止）")
             else:
                 self._final_reply(ts, s, reply)
-                self._send_files(ts, s.workdir, reply, turn_start)
+                self._send_files(ts, s, reply, turn_start)
                 self._goal_drive(ts, s, flag)
                 write_state(s.workdir, "idle", s.last_activity,
                             "上一任务已完成")
@@ -3140,7 +3285,9 @@ class SessionBridge:
             write_state(wd, "failed", "", f"{type(e).__name__}: {e}",
                         extra={"session_id": session_id})
             self._react_state(root, "x")
-            self.post(root, f"恢复会话失败: {type(e).__name__}: {e}")
+            hint = _stderr_hint(wd)
+            self.post(root, f"恢复会话失败: {type(e).__name__}: {e}"
+                            + (f"（acp: {hint}）" if hint else ""))
             with self.lock:
                 self.starting.discard(root)
             self._pump_queue()
@@ -3426,6 +3573,17 @@ class SessionBridge:
             self._peek(root, arg)
         elif cmd == "board":
             self._board_refresh(manual=True, reply_to=root)
+        elif cmd == "pad":
+            self._pad(root)
+        elif cmd == "shot":
+            threading.Thread(target=self._shot, args=(root,),
+                             daemon=True).start()
+        elif cmd == "type":
+            threading.Thread(target=self._inject_text, args=(root, arg),
+                             daemon=True).start()
+        elif cmd == "key":
+            threading.Thread(target=self._inject_key, args=(root, arg),
+                             daemon=True).start()
 
     def _queue_status(self, root):
         with self.lock:
@@ -3601,12 +3759,14 @@ class SessionBridge:
                         extra={"session_id": sid})
             self._react_state(root, "x")
             err = getattr(e, "args", [None])[0] or {}
+            hint = _stderr_hint(wd)
             if "already open" in str(err):
                 self.post(root, f"⛔ `{sid}` 还被桌面/CLI 抓着，抢锁失败。"
                                 "先去那边关掉这个会话（Desktop 关闭 tab，"
                                 "或退出 `devin -r`），再 `!adopt`。")
             else:
-                self.post(root, f"接管失败: {type(e).__name__}: {e}")
+                self.post(root, f"接管失败: {type(e).__name__}: {e}"
+                                + (f"（acp: {hint}）" if hint else ""))
             with self.lock:
                 self.starting.discard(root)
             return
@@ -3699,6 +3859,111 @@ class SessionBridge:
                         f"桌面 `devin -r {sid}` 接管；本线程再发消息"
                         "或 `!adopt` 也能接回来。")
         self._board_touch()
+
+    # Phone-side remote control lives in ~/remote-pad (ydotoold +
+    # wl-clipboard + ScreenCast portal). These commands are thin
+    # wrappers so the same actions are reachable from a Slack thread.
+
+    def _pad_ips(self):
+        ips = []
+        try:
+            r = subprocess.run(["tailscale", "ip", "-4"],
+                               capture_output=True, text=True, timeout=5)
+            ips += r.stdout.split()[:1]
+        except (OSError, subprocess.SubprocessError):
+            pass
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("192.168.1.1", 80))
+            ips.append(s.getsockname()[0])
+            s.close()
+        except OSError:
+            pass
+        return ips or ["127.0.0.1"]
+
+    def _pad(self, root):
+        try:
+            tok = open(PAD_TOKEN).read().strip()
+            ok = bool(re.fullmatch(r"[0-9a-f]{32}", tok))
+        except OSError:
+            ok = False
+        if not ok:
+            self.post(root, "remote-pad 没就绪（缺 token）。")
+            return
+        urls = " ｜ ".join(f"http://{ip}:8877/t/{tok}/"
+                          for ip in self._pad_ips())
+        self.post(root,
+                  "*手机遥控这台电脑*\n"
+                  f"• Web 控制台（打字/触控板/快捷键）：{urls}\n"
+                  "• 完整桌面 RDP：`3389` 已开（Windows App / Jump 等"
+                  "客户端，账号密码=远程桌面设置的那组）\n"
+                  "• KDE Connect（手机键盘/触控板/剪贴板，推荐）：装 KDE "
+                  "Connect app → 配对界面右上角 ⋯ → Add devices by IP → "
+                  "填 `100.69.104.50`；电脑上跑 `~/remote-pad/kdec.sh list`"
+                  " + `kdec.sh pair <id>` 确认配对\n"
+                  "• `!type 文字` `!key ctrl+alt+t` `!shot` 可在本线程"
+                  "直接注入\n"
+                  "手机要开着 Tailscale，或连家里同一个 Wi-Fi。")
+
+    def _shot(self, root):
+        if not os.path.exists(SCREENGRAB):
+            self.post(root, "screengrab 还没装。")
+            return
+        try:
+            r = subprocess.run([sys.executable, SCREENGRAB, "20"],
+                               capture_output=True, timeout=35)
+        except subprocess.TimeoutExpired:
+            r = None
+        png = r.stdout if r and r.returncode == 0 else b""
+        if png:
+            p = os.path.join(self._workdir(root), "shot.png")
+            try:
+                with open(p, "wb") as f:
+                    f.write(png)
+                if self.upload_msg:
+                    self.upload_msg(root, p)
+                    self._react(root, "camera_with_flash")
+                    return
+            except Exception as e:
+                self._log_err("shot upload", e)
+        why = ((r.stderr if r else b"") or b"")
+        why = why.decode("utf-8", "replace")
+        self.post(root, "📷 暂时截不到桌面：" + _one_line(why, 110)
+                        + "（GNOME 只放行「本机点过共享」的抓屏；"
+                          "看实时桌面走 RDP 客户端）")
+
+    def _inject_text(self, root, arg):
+        if not arg:
+            self.post(root, "`!type <文字>` 打进电脑当前焦点窗口"
+                            "（中文自动转剪贴板粘贴）。")
+            return
+        try:
+            r = subprocess.run([sys.executable, INPUTCTL, "type",
+                                arg[:2000]],
+                               capture_output=True, text=True,
+                               timeout=30)
+            out = (r.stdout or r.stderr or "").strip()
+        except (OSError, subprocess.SubprocessError) as e:
+            out = f"{type(e).__name__}: {e}"
+        self._react(root, "keyboard")
+        self.post(root, f"⌨️ 已发送 {len(arg)} 字到电脑"
+                        + ("" if out in ("", "ok") else f"：{out[:80]}"))
+
+    def _inject_key(self, root, arg):
+        if not arg:
+            self.post(root, "`!key <组合>` 给电脑按键，"
+                            "如 `!key ctrl+alt+t`、`!key enter`。")
+            return
+        try:
+            r = subprocess.run([sys.executable, INPUTCTL, "key", arg],
+                               capture_output=True, text=True,
+                               timeout=15)
+            out = (r.stdout or r.stderr or "").strip()
+        except (OSError, subprocess.SubprocessError) as e:
+            out = f"{type(e).__name__}: {e}"
+        self._react(root, "keyboard")
+        self.post(root, f"⌨️ `{arg}`"
+                        + ("" if out in ("", "ok") else f"：{out[:80]}"))
 
     # ---- pinned channel dashboard ---------------------------------
     # One top-level message, pinned, updated in place. Active sessions
@@ -4374,11 +4639,15 @@ class SessionBridge:
             self.post(root, HELP_CARD)
         elif root in self.sessions:
             s = self.sessions[root]
-            if (s.running or s.queued) and \
+            if s.running:
+                # Speaking while it works = interrupt: cancel the
+                # in-flight turn, then this message runs next (FIFO
+                # with other queued user messages is preserved).
+                s.interrupt_ev.set()
+            elif s.queued and \
                     time.monotonic() - s.last_queue_notice > 60:
                 s.last_queue_notice = time.monotonic()
-                self.post(root, "⏸ 收到，已排队——当前任务还在跑，"
-                                "结束才轮到这条；发 `!stop` 可立即打断。")
+                self.post(root, "⏸ 收到，已排队——前面还有你的消息没处理完。")
             self._react(ts, "eyes")
             threading.Thread(target=self._run_prompt,
                              args=(root, text, files, ts),
@@ -4471,6 +4740,15 @@ def main():
         max_retry_count=3,
         error_types=[URLError, ConnectionResetError, RemoteDisconnected,
                      TimeoutError]))
+    # Uploads get their own client: files_upload_v2 is several HTTP
+    # round-trips (upload URL → bytes → complete) and Slack's endpoint
+    # routinely exceeds the shared 15s read timeout on MBs — that's
+    # exactly why deliverables were silently timing out.
+    web_up = WebClient(token=os.environ["SLACK_BOT_TOKEN"], timeout=300)
+    web_up.retry_handlers.append(ConnectionErrorRetryHandler(
+        max_retry_count=3,
+        error_types=[URLError, ConnectionResetError, RemoteDisconnected,
+                     TimeoutError]))
     socket = SocketModeClient(app_token=os.environ["SLACK_APP_TOKEN"],
                               web_client=web, auto_reconnect_enabled=True)
     auth = web.auth_test()
@@ -4496,8 +4774,8 @@ def main():
         web.chat_update(**kw)
 
     def upload(ts, path):
-        web.files_upload_v2(channel=CHANNEL, thread_ts=ts,
-                            file=path, title=os.path.basename(path))
+        web_up.files_upload_v2(channel=CHANNEL, thread_ts=ts,
+                               file=path, title=os.path.basename(path))
 
     def set_status(ts, text):
         web.assistant_threads_setStatus(channel_id=CHANNEL, thread_ts=ts,
