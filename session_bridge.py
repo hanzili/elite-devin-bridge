@@ -100,7 +100,7 @@ import threading
 import time
 import unicodedata
 import urllib.request
-from collections import deque
+from collections import Counter, deque
 
 import limit_governor
 
@@ -505,6 +505,66 @@ ADOPT_MAX_AGE = 6 * 3600
 # Dashboard auto-refresh throttle — a burst of session events collapses
 # into one in-place update instead of N chat_update calls.
 BOARD_GAP = int(os.environ.get("BRIDGE_BOARD_GAP", "30"))
+# Host vitals on the board; a metric over threshold for CLEAN_STRIKES
+# consecutive board samples auto-spawns a cleanup session (auto slot).
+VITAL_DISK = float(os.environ.get("VITAL_DISK_WARN", "85"))
+VITAL_MEM = float(os.environ.get("VITAL_MEM_WARN", "90"))
+VITAL_CPU = float(os.environ.get("VITAL_CPU_WARN", "90"))
+CLEAN_STRIKES = int(os.environ.get("CLEAN_STRIKES", "3"))
+CLEAN_COOLDOWN = float(os.environ.get("CLEAN_COOLDOWN", "1800"))
+AUTOCLEAN = os.environ.get("AUTOCLEAN", "1").lower() \
+    not in ("0", "no", "false")
+CLEAN_PROMPTS = {
+    "disk": "本机磁盘占用已到 {disk}%。请诊断根分区最占空间的目录"
+            "（du -x -d1 逐层看 /、~、/var、~/.cache、journal 日志、"
+            "docker overlay），然后只做安全清理：apt clean、"
+            "journalctl --vacuum-time=7d、清 7 天前的 /tmp、"
+            "docker system prune（只清未用镜像和已停容器）。"
+            "绝不删用户文档、git 仓库、数据库、非缓存数据。"
+            "报告：释放了多大、现在还剩多少。",
+    "mem": "本机内存占用 {mem}% 且持续偏高。用 ps aux --sort=-rss "
+           "找出 RSS 最大的 15 个进程，判断哪些疑似泄露/僵尸/失控。"
+           "可以回收明确的 zombie/defunct；不要杀 devin、slack、"
+           "浏览器、系统服务或你拿不准的进程。报告：主要内存被谁占、"
+           "你处理了什么、建议用户做什么。",
+    "cpu": "本机 CPU 占用 {cpu}% 且持续多轮。用 top -b -n1 和 "
+           "ps aux --sort=-%cpu 找前 10 的烧 CPU 进程，判断是否有"
+           "失控/死循环任务。报告发现；对确认的失控任务给出处理"
+           "建议，不拿准的进程不要直接 kill。",
+}
+# Bridge self-audit: every AUDIT_INTERVAL a 🩺 session reviews the
+# bridge's own logs/state/Slack surfaces and fixes what it safely can.
+AUDIT_INTERVAL = float(os.environ.get("AUDIT_INTERVAL",
+                                      str(12 * 3600)))
+AUDIT_ENABLED = os.environ.get("AUDIT_ENABLED", "1").lower() \
+    not in ("0", "no", "false")
+AUDIT_PROMPT = """你是这座 Slack↔Devin 桥的定期体检医生（每 12 小时一次自动体检）。
+
+桥本体：
+- 代码 ~/elite-devin-bridge/session_bridge.py，服务 systemctl --user
+  status session-bridge，日志 journalctl --user -u session-bridge
+  -n 400 --no-pager
+- 每个 Slack 线程一个工作目录 ~/devin-tasks/<ts>_<rand>/，内含
+  .state.json（running/failed/finished/queued）、inbox/ 用户附件
+- 看板/私聊看板/Canvas 状态：~/devin-tasks/.bridge_board.json
+- 限额挂起状态：~/devin-tasks/.bridge_limits.json（如存在）
+
+本次健康摘要（桥自检）：
+{digest}
+
+请做体检：
+1. 翻 journalctl 最近 400 行：找反复出现的错误模式（上传超时、
+   socket 断连、API 报错、崩溃重启），判断哪些是真问题
+2. 扫 ~/devin-tasks：state=failed 或 queued/running 状态卡了
+   超过 24 小时的线程目录、孤儿 inbox 大文件、.state.json 异常
+3. 验证 Slack 面：频道置顶看板还活着吗（.bridge_board.json 的
+   ts）、DM 看板/Canvas 条目是否有效
+4. 安全修复：把卡死/终态很久的线程目录整体挪到
+   ~/devin-tasks/.trash/（不删）、清掉明显孤儿文件。
+   不要重启服务、不要改 .bridge_board.json、不要动凭据、
+   不要碰正在运行的会话目录
+5. 在线程里输出简短报告：发现的问题、已修的问题、
+   需要用户/开发者注意的事项（如果一切正常就说正常）。"""
 # 'In flight' windows: a mid-turn node (tool result, user msg,
 # assistant+tool_calls) can legitimately go quiet for a long-running
 # command, so the mid-turn cap is generous; a final assistant answer
@@ -1755,8 +1815,16 @@ class SessionBridge:
         self._dm_users = set(filter(None, seed.split(","))) | \
             set(bd.get("users") or [])
         self._dm_boards = dict(bd.get("dm") or {})
+        # vitals: previous counters for rate deltas + autoclean state
+        self._cpu_prev = None
+        self._net_prev = None
+        self._vitals = {}
+        self._clean = {}
+        self._err_stats = Counter()
+        self._started = time.time()
 
     def _log_err(self, label, e):
+        self._err_stats[f"{label}: {_errname(e)}"] += 1
         err = _slack_err(e)
         if err:  # deterministic API-side error: warn once per kind
             key = (label, err)
@@ -4385,7 +4453,88 @@ class SessionBridge:
             lst.sort(key=lambda x: -x[0])
         return bound, hot, cool, idle
 
+    def _sys_vitals(self):
+        """Host vitals straight from /proc — cpu% (delta between
+        renders), mem%, disk% on /, net throughput B/s. No deps."""
+        v = {}
+        try:
+            with open("/proc/stat") as f:
+                vals = [int(x) for x in f.readline().split()[1:8]]
+            idle, total = vals[3] + vals[4], sum(vals)
+            if self._cpu_prev:
+                dt, di = total - self._cpu_prev[0], \
+                    idle - self._cpu_prev[1]
+                if dt > 0:
+                    v["cpu"] = round((1 - di / dt) * 100)
+            self._cpu_prev = (total, idle)
+        except (OSError, ValueError, IndexError):
+            pass
+        try:
+            mi = {}
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    k, _, rest = line.partition(":")
+                    mi[k.strip()] = int(rest.split()[0])
+            t, a = mi["MemTotal"], mi.get("MemAvailable", 0)
+            v["mem"] = round((1 - a / max(t, 1)) * 100)
+            v["mem_gb"] = round((t - a) / 1048576, 1)
+            v["mem_tot"] = round(t / 1048576)
+        except (OSError, ValueError, KeyError):
+            pass
+        try:
+            st = os.statvfs("/")
+            v["disk"] = round((1 - st.f_bavail / st.f_blocks) * 100)
+        except (OSError, ZeroDivisionError):
+            pass
+        try:
+            rx = tx = 0
+            with open("/proc/net/dev") as f:
+                for line in f.readlines()[2:]:
+                    if ":" not in line:
+                        continue
+                    name, rest = line.split(":", 1)
+                    if name.strip() == "lo":
+                        continue
+                    cols = rest.split()
+                    rx += int(cols[0])
+                    tx += int(cols[8])
+            now = time.monotonic()
+            if self._net_prev and now > self._net_prev[0]:
+                dt = now - self._net_prev[0]
+                v["rx"] = (rx - self._net_prev[1]) / dt
+                v["tx"] = (tx - self._net_prev[2]) / dt
+            self._net_prev = (now, rx, tx)
+        except (OSError, ValueError, IndexError):
+            pass
+        self._vitals = v
+        return v
+
+    @staticmethod
+    def _fmt_rate(bps):
+        for u in ("B", "K", "M", "G"):
+            if bps < 1024 or u == "G":
+                return f"{bps:.0f}{u}" if u == "B" \
+                    else f"{bps:.1f}{u}"
+            bps /= 1024
+
+    def _vitals_line(self, v):
+        """🖥 CPU 34% · 内存 62% · ⚠️磁盘 91% · ⬇0.4M ⬆0.1M"""
+        def tag(key, txt, warn):
+            return f"⚠️{txt}" if v.get(key, 0) >= warn else txt
+        parts = []
+        if "cpu" in v:
+            parts.append(tag("cpu", f"CPU {v['cpu']}%", VITAL_CPU))
+        if "mem" in v:
+            parts.append(tag("mem", f"内存 {v['mem']}%", VITAL_MEM))
+        if "disk" in v:
+            parts.append(tag("disk", f"磁盘 {v['disk']}%", VITAL_DISK))
+        if "rx" in v:
+            parts.append(f"⬇{self._fmt_rate(v['rx'])}/s "
+                         f"⬆{self._fmt_rate(v['tx'])}/s")
+        return "🖥 " + " · ".join(parts) if parts else ""
+
     def _board_render(self):
+        vitals = self._sys_vitals()
         bound, hot, cool, idle = self._board_rows()
         L = ["📋 *会话看板* · 更新于 " + time.strftime("%m-%d %H:%M")]
         if bound:
@@ -4417,6 +4566,9 @@ class SessionBridge:
             L.append(f"💤 空闲({len(asleep)}):{names}{more}")
         if not bound and not hot and not cool and not idle:
             L.append("暂无会话。")
+        vline = self._vitals_line(vitals)
+        if vline:
+            L.append(vline)
         L.append("_🔥干活中 ⏸限额冷却 📂被打开没跑 · 下拉接管任意会话_")
         text = "\n".join(L)
 
@@ -4453,7 +4605,7 @@ class SessionBridge:
             blocks.append(sec(f"*{title}*\n`{sid}` {mark}"))
             blocks.append(row_actions(sid))
         for line in L[1:]:
-            if line.startswith(("📂", "💤")):
+            if line.startswith(("📂", "💤", "🖥")):
                 blocks.append({"type": "context", "elements": [
                     {"type": "mrkdwn", "text": line}]})
         # The adopt launcher: one dropdown = take over any unbound
@@ -4514,6 +4666,8 @@ class SessionBridge:
                 self._board_bookmark(ts)
             self._dm_sync(text, blocks)
             self._canvas_sync(text)
+            self._autoclean(self._vitals)
+            self._audit_check()
         if reply_to:
             self.post(reply_to, "看板已刷新（频道置顶那条 📋）。")
 
@@ -4614,6 +4768,95 @@ class SessionBridge:
                 changed = True
         if changed:
             self._dm_persist()
+
+    def _autoclean(self, v):
+        """A metric over threshold for CLEAN_STRIKES consecutive board
+        samples spawns a 🧹 cleanup session (auto slot, cooldown)."""
+        if not (AUTOCLEAN and v):
+            return
+        checks = (("disk", VITAL_DISK), ("mem", VITAL_MEM),
+                  ("cpu", VITAL_CPU))
+        now = time.monotonic()
+        for key, warn in checks:
+            st = self._clean.setdefault(key, [0, 0.0])
+            st[0] = st[0] + 1 if v.get(key, 0) >= warn else 0
+            if st[0] < CLEAN_STRIKES \
+                    or now - st[1] < CLEAN_COOLDOWN:
+                continue
+            st[1] = now
+            st[0] = 0
+            self._spawn_cleanup(key, v)
+
+    def _spawn_cleanup(self, metric, v):
+        label = {"disk": "磁盘", "mem": "内存", "cpu": "CPU"}[metric]
+        val = v.get(metric)
+        if self._auto_live() >= MAX_AUTO:
+            return
+        try:
+            anchor = self.post(
+                None, f"🧹 *自动清理*：{label} {val}% 超阈值，"
+                      "已派会话诊断并安全释放。")
+        except Exception as e:
+            self._log_err("cleanup anchor", e)
+            return
+        if not anchor:
+            return
+        prompt = CLEAN_PROMPTS[metric].format(**v)
+        with self.lock:
+            self.starting.add(anchor)
+            self.starting_auto.add(anchor)
+        threading.Thread(target=self._new_session,
+                         args=(anchor, prompt, None),
+                         daemon=True).start()
+
+    def _audit_check(self):
+        """Every AUDIT_INTERVAL, spawn a 🩺 self-audit session — reads
+        logs/state, verifies surfaces, fixes what's safely fixable."""
+        if not AUDIT_ENABLED:
+            return
+        d = self._board_load()
+        if time.time() - (d.get("audit_at") or 0) < AUDIT_INTERVAL:
+            return
+        if self._auto_live() >= MAX_AUTO:
+            return
+        d["audit_at"] = time.time()
+        self._board_write(d)
+        self._audit_spawn()
+
+    def _audit_spawn(self):
+        up = int(time.time() - self._started)
+        errs = ", ".join(f"{k}×{n}" for k, n in
+                         self._err_stats.most_common(8)) or "无"
+        try:
+            parked = len(self.governor.snapshot() or {})
+        except Exception:
+            parked = 0
+        v = self._vitals
+        digest = (f"桥已运行 {up//3600}h{(up%3600)//60}m · "
+                  f"接管会话 {len(self.sessions)} · "
+                  f"排队 {len(self.dispatch_queue)} · "
+                  f"崩溃重试中 {len(self.crash_retries)} · "
+                  f"限额挂起 {parked} · "
+                  f"DM 看板 {len(self._dm_boards)} 份\n"
+                  f"系统体征：CPU {v.get('cpu','?')}% · "
+                  f"内存 {v.get('mem','?')}% · 磁盘 {v.get('disk','?')}%\n"
+                  f"错误统计（本次运行）：{errs}")
+        try:
+            anchor = self.post(
+                None, "🩺 *桥定期体检*：正在检查日志/状态/Slack 面，"
+                      "报告稍后发到本线程。")
+        except Exception as e:
+            self._log_err("audit anchor", e)
+            return
+        if not anchor:
+            return
+        prompt = AUDIT_PROMPT.format(digest=digest)
+        with self.lock:
+            self.starting.add(anchor)
+            self.starting_auto.add(anchor)
+        threading.Thread(target=self._new_session,
+                         args=(anchor, prompt, None),
+                         daemon=True).start()
 
     def _canvas_sync(self, text):
         """Mirror the board into the channel canvas — a persistent doc

@@ -1892,6 +1892,11 @@ class InteropTest(unittest.TestCase):
         self._pctx = os.environ.get("PCTX_MESSAGES_PUT")
         os.environ["PCTX_MESSAGES_PUT"] = ""
         self._dmseed = os.environ.pop("BOARD_DM_USERS", None)
+        # real host vitals must not spawn cleanup sessions mid-test
+        self._ac = sb.AUTOCLEAN
+        sb.AUTOCLEAN = False
+        self._aud = sb.AUDIT_ENABLED
+        sb.AUDIT_ENABLED = False
         db = sqlite3.connect(self.db_path)
         db.execute("CREATE TABLE sessions(id TEXT PRIMARY KEY,"
                    " working_directory TEXT, backend_type TEXT,"
@@ -1927,6 +1932,8 @@ class InteropTest(unittest.TestCase):
             os.environ["PCTX_MESSAGES_PUT"] = self._pctx
         if self._dmseed is not None:
             os.environ["BOARD_DM_USERS"] = self._dmseed
+        sb.AUTOCLEAN = self._ac
+        sb.AUDIT_ENABLED = self._aud
 
     def make_pins_bridge(self, **kw):
         pinned = []
@@ -2017,6 +2024,7 @@ class InteropTest(unittest.TestCase):
 
     def test_board_posts_once_and_pins(self):
         b, web, pinned = self.make_pins_bridge()
+        b._sys_vitals = lambda: {}  # freeze: live rates would churn text
         b.handle_event(root_ev("bd.1", "<@BTEST> ping"), "EvBD")
         self.assertTrue(self._wait_session(b, "bd.1"))
         web.wait_for("✅ 完成", 15)
@@ -2338,6 +2346,115 @@ class InteropTest(unittest.TestCase):
         self.assertEqual(len(made), 1)  # never a second canvas
         self.assertEqual(edits[-1][0], "FC1")
         self.assertIn("[进去聊](https://x.y/p1)", edits[-1][1])
+
+    def test_board_shows_host_vitals(self):
+        b, web = make_bridge()
+        text, _ = b._board_render()
+        self.assertIn("🖥", text)
+        self.assertIn("内存", text)
+        self.assertIn("磁盘", text)
+
+    def test_autoclean_spawns_after_strikes(self):
+        """Sustained over-threshold → one 🧹 cleanup session, real
+        spawn through the auto path."""
+        old_strikes = sb.CLEAN_STRIKES
+        sb.CLEAN_STRIKES = 3
+        sb.AUTOCLEAN = True
+        try:
+            b, web = make_bridge()
+            for _ in range(2):
+                b._autoclean({"disk": 99})
+            self.assertFalse(web.wait_for("自动清理", 1.5))
+            b._autoclean({"disk": 99})  # third strike
+            self.assertTrue(web.wait_for("🧹", 10))
+            anchor = next(t_ for t_, t in web.posts
+                          if "自动清理" in t)
+            self.assertIsNone(anchor)  # channel-level post, no thread
+            # the spawned session binds under the anchor's message ts
+            deadline = time.monotonic() + 10
+            while not b.sessions and time.monotonic() < deadline:
+                time.sleep(0.05)
+            s = next(iter(b.sessions.values()), None)
+            self.assertIsNotNone(s)
+            if s:
+                s.terminate()
+        finally:
+            sb.CLEAN_STRIKES = old_strikes
+            sb.AUTOCLEAN = False
+
+    def test_autoclean_cooldown_and_reset(self):
+        old = (sb.CLEAN_STRIKES, sb.CLEAN_COOLDOWN)
+        sb.CLEAN_STRIKES, sb.CLEAN_COOLDOWN = 2, 60
+        sb.AUTOCLEAN = True
+        try:
+            b, web = make_bridge()
+            b._autoclean({"mem": 99})
+            b._autoclean({"mem": 99})  # fires
+            n = len([t for _, t in web.posts if "自动清理" in t])
+            b._autoclean({"mem": 99})  # strike 1 again
+            b._autoclean({"mem": 99})  # would fire but cooldown blocks
+            self.assertEqual(
+                len([t for _, t in web.posts if "自动清理" in t]), n)
+            # recovery resets the streak
+            b._autoclean({"mem": 50})
+            self.assertEqual(b._clean["mem"][0], 0)
+            s = next(iter(b.sessions.values()), None)
+            if s:
+                s.terminate()
+        finally:
+            sb.CLEAN_STRIKES, sb.CLEAN_COOLDOWN = old
+            sb.AUTOCLEAN = False
+
+    def test_autoclean_respects_auto_slot(self):
+        old = sb.CLEAN_STRIKES
+        sb.CLEAN_STRIKES = 1
+        sb.AUTOCLEAN = True
+        try:
+            b, web = make_bridge()
+            b.starting_auto.add("occupied")
+            b._autoclean({"cpu": 99})
+            self.assertFalse(web.wait_for("自动清理", 1.5))
+        finally:
+            sb.CLEAN_STRIKES = old
+            sb.AUTOCLEAN = False
+
+    def test_audit_spawns_when_due_then_waits(self):
+        sb.AUDIT_ENABLED = True
+        try:
+            td = tempfile.mkdtemp()
+            b, web = make_bridge(tasks_dir=td)
+            b._audit_check()  # no audit_at on record → due
+            self.assertTrue(web.wait_for("🩺", 10))
+            d = json.load(open(os.path.join(td,
+                                           ".bridge_board.json")))
+            self.assertIn("audit_at", d)
+            n = len([t for _, t in web.posts if "体检" in t])
+            b._audit_check()  # just ran → not due again
+            self.assertEqual(
+                len([t for _, t in web.posts if "体检" in t]), n)
+            deadline = time.monotonic() + 10
+            while not b.sessions and time.monotonic() < deadline:
+                time.sleep(0.05)
+            s = next(iter(b.sessions.values()), None)
+            if s:
+                s.terminate()
+        finally:
+            sb.AUDIT_ENABLED = False
+
+    def test_audit_waits_for_auto_slot(self):
+        sb.AUDIT_ENABLED = True
+        try:
+            td = tempfile.mkdtemp()
+            b, web = make_bridge(tasks_dir=td)
+            b.starting_auto.add("occupied")
+            b._audit_check()
+            self.assertFalse(web.wait_for("体检", 1.5))
+            # slot busy → not marked done; fires once slot frees
+            bp = os.path.join(td, ".bridge_board.json")
+            d = json.load(open(bp)) if os.path.exists(bp) else {}
+            self.assertNotIn("audit_at", d)
+        finally:
+            sb.AUDIT_ENABLED = False
 
 
 class SendablesTest(unittest.TestCase):
