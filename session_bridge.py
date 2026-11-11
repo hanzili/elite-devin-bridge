@@ -1688,7 +1688,8 @@ class SessionBridge:
                  upload=None, status=None, open_modal=None,
                  pin_add=None, pin_list=None, pin_rm=None, team_url=None,
                  ephemeral=None, bookmarks=None, bookmark_add=None,
-                 bookmark_edit=None, permalink=None):
+                 bookmark_edit=None, permalink=None,
+                 dm_post=None, dm_update=None):
         self.post_msg = post
         self.react_msg = react
         self.unreact_msg = unreact
@@ -1737,6 +1738,18 @@ class SessionBridge:
         self.limit_attempts = {}
         self._ext_scan_at = 0.0
         self._acct = _acct_fingerprint()
+        # DM mirror boards: mobile can't reach channel pins/bookmarks,
+        # so every known user gets a copy of the board as the latest
+        # message in their DM with the bot — open Slack, tap the bot,
+        # board is right there. dm_post/dm_update are the only
+        # transports that can address a channel other than self.channel.
+        self.dm_post = dm_post
+        self.dm_update = dm_update
+        bd = self._board_load()
+        seed = os.environ.get("BOARD_DM_USERS", "")
+        self._dm_users = set(filter(None, seed.split(","))) | \
+            set(bd.get("users") or [])
+        self._dm_boards = dict(bd.get("dm") or {})
 
     def _log_err(self, label, e):
         err = _slack_err(e)
@@ -4161,20 +4174,34 @@ class SessionBridge:
     def _board_path(self):
         return os.path.join(self.tasks_dir, ".bridge_board.json")
 
-    def _board_saved_ts(self):
+    def _board_load(self):
         try:
             with open(self._board_path()) as f:
-                return (json.load(f) or {}).get("ts")
+                return json.load(f) or {}
         except (OSError, ValueError):
-            return None
+            return {}
 
-    def _board_save_ts(self, ts):
+    def _board_write(self, d):
         try:
             os.makedirs(self.tasks_dir, exist_ok=True)
             with open(self._board_path(), "w") as f:
-                json.dump({"ts": ts}, f)
+                json.dump(d, f)
         except OSError:
             pass
+
+    def _board_saved_ts(self):
+        return self._board_load().get("ts")
+
+    def _board_save_ts(self, ts):
+        d = self._board_load()
+        d["ts"] = ts
+        self._board_write(d)
+
+    def _dm_persist(self):
+        d = self._board_load()
+        d["dm"] = self._dm_boards
+        d["users"] = sorted(self._dm_users)
+        self._board_write(d)
 
     def _session_fresh(self, sid):
         """Newest transcript node ts — the honest 'is it working'
@@ -4480,6 +4507,7 @@ class SessionBridge:
                 if updated or ts:
                     self._board_text = text
                 self._board_bookmark(ts)
+            self._dm_sync(text, blocks)
         if reply_to:
             self.post(reply_to, "看板已刷新（频道置顶那条 📋）。")
 
@@ -4514,12 +4542,12 @@ class SessionBridge:
                 return
             except Exception as e:
                 self._log_err("board ephemeral", e)
-        self.post(root, "看板在频道置顶那条 📋——频道名下面的"
-                        "「会话看板」书签可以直达。")
+        self.post(root, "看板在频道置顶那条 📋——和机器人的私聊里也"
+                        "有一份实时同步的，手机上最顺手。")
 
     def _board_bookmark(self, ts):
         """Keep a channel header bookmark aimed at the pinned board —
-        one tap on mobile instead of hunting the pins list."""
+        desktop-only surface; the DM mirror is the mobile answer."""
         if not (self.bookmarks and self.bookmark_add
                 and self.permalink and ts):
             return
@@ -4538,15 +4566,58 @@ class SessionBridge:
         except Exception as e:
             self._log_err("board bookmark", e)
 
-    def _board_peek(self, sid, who):
+    def _dm_seen(self, user):
+        """Any real user who talks to (or clicks) the bridge gets a DM
+        board: one message in their bot DM, kept current by _dm_sync.
+        Skips the bot itself and Slack's own plumbing users."""
+        if not user or user in ("USLACKBOT", self.own_user_id) \
+                or user in self._dm_users:
+            return
+        self._dm_users.add(user)
+        self._dm_persist()
+        try:
+            self._dm_sync(*self._board_render())
+        except Exception as e:
+            self._log_err("dm board first paint", e)
+
+    def _dm_sync(self, text, blocks):
+        """Mirror the channel board into every known user's bot DM.
+        First contact posts (capturing the DM channel id); refreshes
+        update in place; a dead message is reposted on the next pass."""
+        if not (self.dm_post and self.dm_update and self._dm_users):
+            return
+        changed = False
+        for uid in list(self._dm_users):
+            ent = self._dm_boards.get(uid) or {}
+            try:
+                if ent.get("channel") and ent.get("ts"):
+                    try:
+                        self.dm_update(ent["channel"], ent["ts"],
+                                       text, blocks)
+                        continue
+                    except Exception as e:
+                        self._log_err("dm board update", e)
+                r = self.dm_post(uid, text, blocks)
+                if r and r.get("channel") and r.get("ts"):
+                    self._dm_boards[uid] = {"channel": r["channel"],
+                                            "ts": r["ts"]}
+                    changed = True
+            except Exception as e:
+                self._log_err("dm board post", e)
+                self._dm_boards.pop(uid, None)
+                changed = True
+        if changed:
+            self._dm_persist()
+
+    def _board_peek(self, sid, who, chan=None):
         """Peek without stealing: the last few transcript actions go
         to an ephemeral message only the clicker sees. Falls back to a
         reply under the board itself when no ephemeral transport."""
         text = self._peek_text(sid)
         if self.ephemeral_msg and who:
             try:
-                self.ephemeral_msg(channel=self.channel, user=who,
-                                   text=text)
+                self.ephemeral_msg(channel=chan or self.channel,
+                                   user=who, text=text)
                 return
             except Exception as e:
                 self._log_err("ephemeral", e)
@@ -4566,6 +4637,8 @@ class SessionBridge:
         msg = payload.get("message") or {}
         root = msg.get("thread_ts") or msg.get("ts")
         who = (payload.get("user") or {}).get("id")
+        chan = (payload.get("channel") or {}).get("id")
+        self._dm_seen(who)
         for action in payload.get("actions") or []:
             aid = action.get("action_id")
             if aid == "ctl_stop":
@@ -4586,7 +4659,7 @@ class SessionBridge:
             if aid == "board_peek":
                 sid = action.get("value")
                 if sid:
-                    self._board_peek(sid, who)
+                    self._board_peek(sid, who, chan)
                 continue
             if aid == "perm_reason":
                 is_perm = False
@@ -4767,6 +4840,7 @@ class SessionBridge:
         if not self._dedupe(self.seen_msg_keys, self.seen_msgs,
                             (ev.get("channel"), ts)):
             return
+        self._dm_seen(ev.get("user"))
         text = MENTION.sub("", ev.get("text", "")).strip()
         files = ev.get("files") or []
         root = ev.get("thread_ts", ts)
@@ -5037,6 +5111,17 @@ def main():
         web.bookmarks_edit(bookmark_id=bid, channel_id=CHANNEL,
                            link=link)
 
+    def dm_post(uid, text, blocks=None):
+        r = web.chat_postMessage(channel=uid, text=text,
+                                 blocks=blocks)
+        return {"channel": r.get("channel"), "ts": r.get("ts")}
+
+    def dm_update(chan, ts, text, blocks=None):
+        kw = {"channel": chan, "ts": ts, "text": text}
+        if blocks is not None:
+            kw["blocks"] = blocks
+        web.chat_update(**kw)
+
     bridge = SessionBridge(post, own_bot_id=own_bot_id,
                            own_user_id=own_user_id,
                            react=react, unreact=unreact, update=update,
@@ -5047,7 +5132,8 @@ def main():
                            ephemeral=ephemeral, bookmarks=bookmarks,
                            bookmark_add=bookmark_add,
                            bookmark_edit=bookmark_edit,
-                           permalink=permalink)
+                           permalink=permalink,
+                           dm_post=dm_post, dm_update=dm_update)
     signal.signal(signal.SIGHUP,
                   lambda *a: bridge.reload_ev.set())
     signal.signal(signal.SIGTERM,

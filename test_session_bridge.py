@@ -28,6 +28,9 @@ class FakeWeb:
         self.posts = []
         self.updates = []
         self.blocks = []
+        self.dm_posts = []
+        self.dm_updates = []
+        self.dm_update_fail = False
         self.lock = threading.Lock()
 
     def post(self, ts, text, blocks=None):
@@ -43,6 +46,18 @@ class FakeWeb:
             self.posts.append((msg_ts, text))
             if blocks is not None:
                 self.blocks.append((msg_ts, blocks))
+
+    def dm_post(self, uid, text, blocks=None):
+        with self.lock:
+            self.dm_posts.append((uid, text, blocks))
+            n = len(self.dm_posts)
+            return {"channel": f"D{uid}", "ts": f"dm{n}"}
+
+    def dm_update(self, chan, ts, text, blocks=None):
+        with self.lock:
+            if self.dm_update_fail:
+                raise OSError("dm update failed")
+            self.dm_updates.append((chan, ts, text))
 
     def texts(self, ts=None):
         with self.lock:
@@ -2239,6 +2254,64 @@ class InteropTest(unittest.TestCase):
         b.handle_event(reply_ev("pb.1", "pb.3", "!peek"), "EvPB3")
         self.assertTrue(web.wait_for("收到: hello desk", 10))
         b.sessions["pb.1"].terminate()
+
+    def _dm_bridge(self, **kw):
+        b, web = make_bridge(**kw)
+        b.dm_post = web.dm_post
+        b.dm_update = web.dm_update
+        return b, web
+
+    def test_dm_board_posted_for_known_user(self):
+        """A real user's first message earns them a DM mirror of the
+        board — the mobile-reachable surface."""
+        b, web = self._dm_bridge()
+        b.handle_event(reply_ev("dm.1", "dm.2", "!sessions",
+                                user="U9"), "EvDM")
+        posts = [p for p in web.dm_posts if p[0] == "U9"]
+        self.assertEqual(len(posts), 1)
+        self.assertIn("会话看板", posts[0][1])
+        self.assertEqual(b._dm_boards["U9"]["channel"], "DU9")
+
+    def test_dm_board_updates_in_place(self):
+        b, web = self._dm_bridge()
+        b.handle_event(reply_ev("dm.1", "dm.2", "!sessions",
+                                user="U9"), "EvDM")
+        b._board_refresh(manual=True)
+        self.assertTrue(web.dm_updates)
+        chan, ts, text = web.dm_updates[-1]
+        self.assertEqual(chan, "DU9")
+        self.assertIn("会话看板", text)
+        self.assertEqual(len(web.dm_posts), 1)  # no repost
+
+    def test_dm_board_reposts_when_update_fails(self):
+        b, web = self._dm_bridge()
+        b.handle_event(reply_ev("dm.1", "dm.2", "!sessions",
+                                user="U9"), "EvDM")
+        web.dm_update_fail = True
+        b._board_refresh(manual=True)
+        self.assertEqual(len(web.dm_posts), 2)  # dead entry reposted
+
+    def test_dm_seen_ignores_bot_and_dupes(self):
+        b, web = self._dm_bridge()
+        b.handle_event(root_ev("dm.1", "<@BTEST> ping"), "EvDM0")
+        b.handle_event(reply_ev("dm.1", "dm.2", "a", user="U9"), "EvDM1")
+        b.handle_event(reply_ev("dm.1", "dm.3", "b", user="U9"), "EvDM2")
+        b.handle_event(reply_ev("dm.1", "dm.4", "c",
+                                user="USLACKBOT"), "EvDM3")
+        self.assertEqual(len(web.dm_posts), 1)  # once, for U9 only
+        self.assertNotIn("USLACKBOT", b._dm_users)
+        s = self._wait_session(b, "dm.1")
+        if s:
+            s.terminate()
+
+    def test_dm_state_persists_across_restart(self):
+        td = tempfile.mkdtemp()
+        b, web = self._dm_bridge(tasks_dir=td)
+        b.handle_event(reply_ev("dm.1", "dm.2", "!sessions",
+                                user="U9"), "EvDM")
+        b2, _ = self._dm_bridge(tasks_dir=td)
+        self.assertIn("U9", b2._dm_users)
+        self.assertEqual(b2._dm_boards["U9"]["channel"], "DU9")
 
 
 class SendablesTest(unittest.TestCase):
