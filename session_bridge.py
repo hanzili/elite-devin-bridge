@@ -104,6 +104,14 @@ from collections import Counter, deque
 
 import limit_governor
 
+# UI language: "en" (default) or "zh". Input parsing accepts both
+# languages regardless — L() only switches what the bridge prints.
+BRIDGE_LANG = os.environ.get("BRIDGE_LANG", "en").lower()
+
+def L(zh, en):
+    """Return the UI string for the active BRIDGE_LANG."""
+    return zh if BRIDGE_LANG == "zh" else en
+
 TASKS_DIR = os.path.expanduser(os.environ.get("DEVIN_TASKS_DIR", "~/devin-tasks"))
 IDLE_SEC = float(os.environ.get("SESSION_IDLE_SEC", "3600"))
 TIMEOUT = float(os.environ.get("PROMPT_TIMEOUT", "1800"))
@@ -115,8 +123,8 @@ def _perm_timeout_hint():
     """Human label for the auto-deny timeout. `inf` means the request
     never auto-denies — int(inf) raises OverflowError, so guard it."""
     if not math.isfinite(PERM_TIMEOUT):
-        return "不自动拒绝"
-    return f"{int(PERM_TIMEOUT)} 秒未答复自动拒绝"
+        return L("不自动拒绝", "no auto-deny")
+    return L(f"{int(PERM_TIMEOUT)} 秒未答复自动拒绝", f"auto-deny after {int(PERM_TIMEOUT)}s without reply")
 PROGRESS_MIN_GAP = float(os.environ.get("BRIDGE_PROGRESS_GAP", "3"))
 DRAFT_ENABLED = os.environ.get("BRIDGE_DRAFT", "1") != "0"
 DRAFT_MIN_GAP = float(os.environ.get("BRIDGE_DRAFT_GAP", "1.5"))
@@ -266,10 +274,17 @@ def _one_line(s, n=60):
 
 # remote-pad lives outside the bridge: inputctl injects keys/pointer via
 # ydotoold, screengrab pulls a frame through the ScreenCast portal.
-PAD_TOKEN = os.path.expanduser("~/.config/remote-pad/token")
-PAD_DIR = os.path.expanduser("~/remote-pad")
+PAD_TOKEN = os.path.expanduser(os.environ.get(
+    "BRIDGE_PAD_TOKEN", "~/.config/remote-pad/token"))
+PAD_DIR = os.path.expanduser(os.environ.get("BRIDGE_PAD_DIR",
+                                           "~/remote-pad"))
 INPUTCTL = os.path.join(PAD_DIR, "inputctl.py")
 SCREENGRAB = os.path.join(PAD_DIR, "screengrab.py")
+# Remote-control commands (!pad/!shot/!type/!key) only exist when a
+# remote-pad install is present — BRIDGE_PAD=1 forces on, =0 forces off.
+_pad_env = os.environ.get("BRIDGE_PAD", "auto")
+PAD_ENABLED = _pad_env == "1" or (_pad_env != "0"
+                                 and os.path.isdir(PAD_DIR))
 
 
 def _open_capped_append(path, cap=512 * 1024):
@@ -359,9 +374,9 @@ GOAL_WATCH_SEC = float(os.environ.get("BRIDGE_GOAL_WATCH_SEC", "3"))
 GOAL_RESUME_MAX = int(os.environ.get("BRIDGE_GOAL_RESUME_MAX", "40"))
 GOAL_AUTO_RESUME = os.environ.get("BRIDGE_GOAL_AUTO_RESUME", "1") != "0"
 GOAL_FILES = (".devin-goal-native", ".devin-goal")
-GOAL_STATUS_CN = {"running": "进行中", "paused": "已暂停",
-                  "blocked": "已阻塞", "complete": "已完成",
-                  "cleared": "已清除"}
+GOAL_STATUS_CN = {"running": L("进行中", "in progress"), "paused": L("已暂停", "paused"),
+                  "blocked": L("已阻塞", "blocked"), "complete": L("已完成", "done"),
+                  "cleared": L("已清除", "cleared")}
 # Server-side limit handling: a turn killed by "Reached … rate limit"
 # or a retryable refusal parks into .bridge_limits.json instead of
 # failing; the sweeper re-runs it after the server's quoted reset
@@ -405,11 +420,11 @@ LIMIT_EXT_POST = os.environ.get("BRIDGE_LIMIT_EXT_POST", "1") != "0"
 LIMIT_EXT_FRESH = float(os.environ.get("BRIDGE_LIMIT_EXT_FRESH", "600"))
 EXT_RESUME_PROMPT = os.environ.get(
     "BRIDGE_LIMIT_EXT_PROMPT",
-    "（自动恢复：服务端限额冷却已结束）请继续完成刚才被中断的工作；"
-    "如果上一轮其实已经做完，简短回复已完成即可。")
-RESUME_NUDGE = ("（自动恢复：上一轮因服务端限额中断）请继续未完成的"
-                "工作；如果已经做完，简短回复已完成即可。")
-AGENTS_TMPL = """# 桥会话上下文
+    L("（自动恢复：服务端限额冷却已结束）请继续完成刚才被中断的工作；", "(auto-resume: server-side limit cooldown ended) please continue the interrupted work;") +
+    L("如果上一轮其实已经做完，简短回复已完成即可。", "If the last turn actually finished, just reply briefly that it's done."))
+RESUME_NUDGE = (L("（自动恢复：上一轮因服务端限额中断）请继续未完成的", "(auto-resume: last turn was cut by a server-side limit) please continue the unfinished") +
+                L("工作；如果已经做完，简短回复已完成即可。", 'work; if it already finished, a brief "done" reply is fine.'))
+AGENTS_TMPL = L("""# 桥会话上下文
 
 - 本目录绑定 Slack 线程 {ts}，是你与该线程的持久工作目录。
 - 全局记忆：{mem} —— 开工先读；学到需要跨会话保留的事（用户偏好、
@@ -423,7 +438,24 @@ AGENTS_TMPL = """# 桥会话上下文
   特意迁就 Slack 语法。
 - 清理进程只杀自己登记过的 PID/进程组：禁止 `pkill -f "devin acp"` 之类
   全模式匹配——所有线程会话共用同一命令行，误杀会带走全部会话（含你自己）。
-"""
+""", """# Bridge session context
+
+- This directory is bound to Slack thread {ts} — your persistent
+  workdir for the thread.
+- Global memory: {mem} — read it first; append durable cross-session
+  facts (user preferences, decisions, key paths, project state) under
+  dated headings, keep it concise.
+- Thread memory: `.bridge_thread_memory.md` here, same rules.
+- To send the user files/images: write the absolute path in your reply;
+  the bridge uploads it to the thread.
+- User attachments land in `inbox/` here; reference their paths.
+- No timeout, no length cap, no approval deadline on this bridge.
+- Reply in standard Markdown: **bold**, # headings, | tables |,
+  [links](url), - [ ] checklists — the bridge renders it for Slack.
+- Only kill PIDs/process groups you registered: never broad-match like
+  `pkill -f "devin acp"` — all thread sessions share one command line
+  and a stray match kills every session (including yours).
+""")
 MENTION = re.compile(r"<@[A-Z0-9]+>")
 STOP_WORDS = {"停止", "stop", "cancel", "取消", "停", "停下", "停一下",
               "打断", "别跑了", "终止", "停止运行", "取消任务"}
@@ -467,7 +499,7 @@ BANG_CMDS = {
 # bridge answers itself (goal files + RPC + markers).
 GOAL_ARG_CLEAR = {"clear", "cancel", "stop", "off", "remove", "rm",
                   "取消", "删除", "清除"}
-HELP_CARD = """*桥命令*（`!` 开头是命令，不带 `!` 就是聊天）
+HELP_CARD = L("""*桥命令*（`!` 开头是命令，不带 `!` 就是聊天）
 • `!stop` — 立刻停止当前执行；挂着的目标会一并清除
 • `!status` / `!queue` — 当前状态 / 排队情况
 • `!goal <内容>` — 挂一个自动长跑目标；`!goal cancel` 撤掉
@@ -490,7 +522,26 @@ HELP_CARD = """*桥命令*（`!` 开头是命令，不带 `!` 就是聊天）
 • `!reload` — 桥服务热重启，在跑的会话不中断
 • `!help` — 本卡片
 其它 `!命令` 原样发给会话（如 `!mode`、`!clear`）。
-也能直接说中文：停止 / 取消目标 / 状态 / 桥重启 / 允许 / 拒绝 / 审批。"""
+也能直接说中文：停止 / 取消目标 / 状态 / 桥重启 / 允许 / 拒绝 / 审批。""",
+"""*Bridge commands* (`!`-prefixed are commands; plain text chats)
+• `!stop` — stop the current run; clears any attached goal
+• `!status` / `!queue` — current state / queued work
+• `!goal <text>` — attach a long-running auto goal; `!goal cancel` drops it
+• `!allow` / `!deny` — answer a pending approval (or tap its buttons)
+• `!approvals` — pending approval list
+• `!reset` — reset this thread's session; next message starts fresh
+• `!sessions` — list this machine's Devin sessions (Desktop/CLI/bridge)
+• `!adopt [session-id]` — pull a Desktop/CLI session into this thread; no id adopts the latest
+• `!handoff` — show this thread's session id for `devin -r` or Desktop
+• `!release` — release the session (context kept; re-adopt any time)
+• `!limits` — rate-limit cooldown queue (parked turns, retry times)
+• `!peek [session-id]` — look without touching: recent activity, no lock
+• `!board` — an ephemeral live board only you can see; the channel bookmark jumps to the pinned board
+• `!files` — files produced in this thread, ready to pull
+• `!send <name|all>` — pull files: one by name or all pending
+• `!reload` — hot-restart the bridge; running sessions unaffected
+• `!help` — this card
+Any other `!cmd` is passed to the session as a slash command (e.g. `!mode`, `!clear`).""")
 TERMINAL = {"finished", "stopped", "failed", "timeout", "crashed",
             "interrupted", "reaped"}
 CRASH_RESUME_MAX = 2
@@ -512,33 +563,33 @@ VITAL_MEM = float(os.environ.get("VITAL_MEM_WARN", "90"))
 VITAL_CPU = float(os.environ.get("VITAL_CPU_WARN", "90"))
 CLEAN_STRIKES = int(os.environ.get("CLEAN_STRIKES", "3"))
 CLEAN_COOLDOWN = float(os.environ.get("CLEAN_COOLDOWN", "1800"))
-AUTOCLEAN = os.environ.get("AUTOCLEAN", "1").lower() \
+AUTOCLEAN = os.environ.get("AUTOCLEAN", "0").lower() \
     not in ("0", "no", "false")
 CLEAN_PROMPTS = {
-    "disk": "本机磁盘占用已到 {disk}%。请诊断根分区最占空间的目录"
-            "（du -x -d1 逐层看 /、~、/var、~/.cache、journal 日志、"
-            "docker overlay），然后只做安全清理：apt clean、"
-            "journalctl --vacuum-time=7d、清 7 天前的 /tmp、"
-            "docker system prune（只清未用镜像和已停容器）。"
-            "绝不删用户文档、git 仓库、数据库、非缓存数据。"
-            "报告：释放了多大、现在还剩多少。",
-    "mem": "本机内存占用 {mem}% 且持续偏高。用 ps aux --sort=-rss "
-           "找出 RSS 最大的 15 个进程，判断哪些疑似泄露/僵尸/失控。"
-           "可以回收明确的 zombie/defunct；不要杀 devin、slack、"
-           "浏览器、系统服务或你拿不准的进程。报告：主要内存被谁占、"
-           "你处理了什么、建议用户做什么。",
-    "cpu": "本机 CPU 占用 {cpu}% 且持续多轮。用 top -b -n1 和 "
-           "ps aux --sort=-%cpu 找前 10 的烧 CPU 进程，判断是否有"
-           "失控/死循环任务。报告发现；对确认的失控任务给出处理"
-           "建议，不拿准的进程不要直接 kill。",
+    "disk": L("本机磁盘占用已到 {disk}%。请诊断根分区最占空间的目录", "Host disk usage hit {disk}%. Diagnose the biggest directories on the root partition") +
+            L("（du -x -d1 逐层看 /、~、/var、~/.cache、journal 日志、", "(du -x -d1 across /, ~, /var, ~/.cache, journal logs,") +
+            L("docker overlay），然后只做安全清理：apt clean、", "docker overlay), then only safe cleanup: apt clean,") +
+            L("journalctl --vacuum-time=7d、清 7 天前的 /tmp、", "journalctl --vacuum-time=7d, clear /tmp files older than 7 days,") +
+            L("docker system prune（只清未用镜像和已停容器）。", "docker system prune (unused images and stopped containers only).") +
+            L("绝不删用户文档、git 仓库、数据库、非缓存数据。", "Never delete user docs, git repos, databases, or non-cache data.") +
+            L("报告：释放了多大、现在还剩多少。", "Report: how much was freed and how much remains."),
+    "mem": L("本机内存占用 {mem}% 且持续偏高。用 ps aux --sort=-rss ", "Host memory is at {mem}% and staying high. Use ps aux --sort=-rss to ") +
+           L("找出 RSS 最大的 15 个进程，判断哪些疑似泄露/僵尸/失控。", "find the top-15 RSS processes and judge which look leaked/zombie/runaway.") +
+           L("可以回收明确的 zombie/defunct；不要杀 devin、slack、", "You may reap clear zombie/defunct procs; don't kill devin, slack,") +
+           L("浏览器、系统服务或你拿不准的进程。报告：主要内存被谁占、", "browsers, system services, or anything you're unsure of. Report: who holds the memory,") +
+           L("你处理了什么、建议用户做什么。", "what you did, and what you recommend the user do."),
+    "cpu": L("本机 CPU 占用 {cpu}% 且持续多轮。用 top -b -n1 和 ", "Host CPU is at {cpu}% and stayed high across samples. Use top -b -n1 and ") +
+           L("ps aux --sort=-%cpu 找前 10 的烧 CPU 进程，判断是否有", "ps aux --sort=-%cpu to find the top-10 CPU burners and check for") +
+           L("失控/死循环任务。报告发现；对确认的失控任务给出处理", "runaway/looping tasks. Report findings; for confirmed runaways give") +
+           L("建议，不拿准的进程不要直接 kill。", "recommendations; don't kill anything you're unsure about."),
 }
 # Bridge self-audit: every AUDIT_INTERVAL a 🩺 session reviews the
 # bridge's own logs/state/Slack surfaces and fixes what it safely can.
 AUDIT_INTERVAL = float(os.environ.get("AUDIT_INTERVAL",
                                       str(12 * 3600)))
-AUDIT_ENABLED = os.environ.get("AUDIT_ENABLED", "1").lower() \
+AUDIT_ENABLED = os.environ.get("AUDIT_ENABLED", "0").lower() \
     not in ("0", "no", "false")
-AUDIT_PROMPT = """你是这座 Slack↔Devin 桥的定期体检医生（每 12 小时一次自动体检）。
+AUDIT_PROMPT = L("""你是这座 Slack↔Devin 桥的定期体检医生（每 12 小时一次自动体检）。
 
 桥本体：
 - 代码 ~/elite-devin-bridge/session_bridge.py，服务 systemctl --user
@@ -564,7 +615,37 @@ AUDIT_PROMPT = """你是这座 Slack↔Devin 桥的定期体检医生（每 12 �
    不要重启服务、不要改 .bridge_board.json、不要动凭据、
    不要碰正在运行的会话目录
 5. 在线程里输出简短报告：发现的问题、已修的问题、
-   需要用户/开发者注意的事项（如果一切正常就说正常）。"""
+   需要用户/开发者注意的事项（如果一切正常就说正常）。""",
+"""You are the scheduled self-audit doctor for this Slack↔Devin bridge
+(runs every AUDIT_INTERVAL seconds when AUDIT_ENABLED=1).
+
+Bridge internals:
+- Code: ~/elite-devin-bridge/session_bridge.py; service: systemctl
+  --user status session-bridge; logs: journalctl --user -u
+  session-bridge -n 400 --no-pager
+- One workdir per Slack thread: ~/devin-tasks/<ts>_<rand>/ containing
+  .state.json (running/failed/finished/queued) and inbox/ attachments
+- Board/DM-board/Canvas state: ~/devin-tasks/.bridge_board.json
+- Parked limit turns: ~/devin-tasks/.bridge_limits.json (if present)
+
+Health digest produced by the bridge itself:
+{digest}
+
+Audit steps:
+1. Scan the last 400 journalctl lines for repeating error patterns
+   (upload timeouts, socket drops, API errors, crash restarts) and
+   judge which are real problems
+2. Scan ~/devin-tasks for thread dirs stuck in failed or
+   queued/running state over 24h, orphaned large inbox files, and
+   malformed .state.json
+3. Verify Slack surfaces: is the pinned channel board still alive
+   (the ts in .bridge_board.json), are DM-board/canvas entries valid
+4. Safe fixes only: move long-stuck or terminal thread dirs into
+   ~/devin-tasks/.trash/ (never delete), remove obvious orphans.
+   Do NOT restart the service, modify .bridge_board.json, touch
+   credentials, or touch dirs of sessions that are still running
+5. Post a short report in the thread: problems found, fixes applied,
+   and items needing human attention (if all clear, say so).""")
 # 'In flight' windows: a mid-turn node (tool result, user msg,
 # assistant+tool_calls) can legitimately go quiet for a long-running
 # command, so the mid-turn cap is generous; a final assistant answer
@@ -578,19 +659,19 @@ BOARD_MAX_ROWS = int(os.environ.get("BRIDGE_BOARD_MAX_ROWS", "10"))
 LOST_TURN_GRACE = 120
 
 STATE_NAMES = {
-    "starting": "启动中",
-    "queued": "排队中",
-    "idle": "等待中（空闲）",
-    "running": "执行中",
-    "stopping": "正在停止",
-    "finished": "已完成",
-    "stopped": "已停止",
-    "failed": "出错结束",
-    "timeout": "静默超时终止",
-    "crashed": "进程异常退出",
-    "interrupted": "已中断（桥服务重启）",
-    "reaped": "已回收（空闲超时）",
-    "rate_limited": "限额冷却中（待自动重试）",
+    "starting": L("启动中", "starting"),
+    "queued": L("排队中", "queued"),
+    "idle": L("等待中（空闲）", "waiting (idle)"),
+    "running": L("执行中", "running"),
+    "stopping": L("正在停止", "stopping"),
+    "finished": L("已完成", "done"),
+    "stopped": L("已停止", "stopped"),
+    "failed": L("出错结束", "ended with error"),
+    "timeout": L("静默超时终止", "silence-timeout terminated"),
+    "crashed": L("进程异常退出", "process exited"),
+    "interrupted": L("已中断（桥服务重启）", "interrupted (bridge restarted)"),
+    "reaped": L("已回收（空闲超时）", "reaped (idle timeout)"),
+    "rate_limited": L("限额冷却中（待自动重试）", "limit cooldown (auto-retry pending)"),
 }
 
 # Serializes every read-modify-write of the per-thread state and
@@ -759,7 +840,7 @@ def resolve_approval(workdir, request_id, session_id=None, **fields):
 def _perm_summary(tool_call):
     """Non-sensitive one-line summary: title + first path/command."""
     if not isinstance(tool_call, dict):
-        return "(未知操作)"
+        return L("(未知操作)", "(unknown action)")
     parts = []
     title = tool_call.get("title")
     if isinstance(title, str) and title.strip():
@@ -774,7 +855,7 @@ def _perm_summary(tool_call):
         if isinstance(loc, dict) and isinstance(loc.get("path"), str):
             parts.append(loc["path"])
             break
-    text = " ".join(parts) or tool_call.get("toolCallId") or "(未知操作)"
+    text = " ".join(parts) or tool_call.get("toolCallId") or L("(未知操作)", "(unknown action)")
     return re.sub(r"\s+", " ", text)[:160]
 
 
@@ -794,7 +875,7 @@ def mark_interrupted(tasks_dir, skip=()):
         st = read_state(wd)
         if st and st.get("state") not in TERMINAL:
             write_state(wd, "interrupted", st.get("activity", ""),
-                        "桥服务重启，会话随之结束；回复本线程可恢复")
+                        L("桥服务重启，会话随之结束；回复本线程可恢复", "bridge restarted, session ended; reply in this thread to restore"))
             out.append((".".join(name.rsplit("_", 1)), st))
         with _file_lock:
             records, ledger = load_approvals(wd)
@@ -879,7 +960,7 @@ def split_chunks(text, limit=None):
             cur = f"{cur}\n{line}" if cur else line
     if cur:
         chunks.append(cur)
-    return chunks or ["(无输出)"]
+    return chunks or [L("(无输出)", "(no output)")]
 
 
 _MD_LINK = re.compile(r"\[([^\]]+)\]\((https?://[^)\s]+)\)")
@@ -1042,7 +1123,7 @@ class DevinSession:
         self.timeout = timeout
         exe = shutil.which(cmd[0])
         if not exe:
-            raise FileNotFoundError(f"{cmd[0]!r} 不在 PATH")
+            raise FileNotFoundError(L(f"{cmd[0]!r} 不在 PATH", f"{cmd[0]!r} not on PATH"))
         errlog = _open_capped_append(
             os.path.join(workdir, ".acp_stderr.log"))
         try:
@@ -1054,7 +1135,7 @@ class DevinSession:
         finally:
             errlog.close()
         self._init_state()
-        write_state(self.workdir, "starting", "acp 已启动")
+        write_state(self.workdir, "starting", L("acp 已启动", "acp started"))
 
     @classmethod
     def reattach(cls, thread_ts, workdir, timeout, pid, stdin_fd,
@@ -1084,7 +1165,7 @@ class DevinSession:
         self.last_progress = 0.0
         self.last_shown = None
         self.status_ts = None
-        self.last_activity = "启动中"
+        self.last_activity = L("启动中", "starting")
         self.last_activity_at = time.monotonic()
         self.chunks = []
         self.think_chunks = []
@@ -1184,7 +1265,7 @@ class DevinSession:
             kind = upd.get("sessionUpdate")
             if kind == "agent_message_chunk":
                 self.chunks.append(upd.get("content", {}).get("text", ""))
-                self._note("正在输出")
+                self._note(L("正在输出", "outputting"))
                 if self.on_text:
                     try:
                         self.on_text()
@@ -1208,7 +1289,7 @@ class DevinSession:
                     if p:
                         self.touched[p] = True
                 if title:
-                    self._note(f"工具: {title}")
+                    self._note(L(f"工具: {title}", f"tool: {title}"))
                     if kind == "tool_call" and (
                             not self.recent
                             or self.recent[-1] != self.last_activity):
@@ -1228,7 +1309,7 @@ class DevinSession:
                                + str(doing.get("content", ""))[:80]
                                + f"（{done}/{len(entries)}）")
                 elif entries:
-                    self._note(f"📋 计划 {done}/{len(entries)} 项")
+                    self._note(L(f"📋 计划 {done}/{len(entries)} 项", f"📋 plan {done}/{len(entries)}"))
                 if doing or entries:
                     on_progress(self.last_activity)
             elif kind == "agent_thought_chunk":
@@ -1237,7 +1318,7 @@ class DevinSession:
                     self.think_chunks.append(txt)
                     self.think_buf = (self.think_buf + txt)[-160:]
                 snip = re.sub(r"\s+", " ", self.think_buf)[-80:].strip()
-                self._note("🧠 " + snip if snip else "思考中")
+                self._note("🧠 " + snip if snip else L("思考中", "thinking"))
             elif kind == "current_mode_update":
                 cid = upd.get("currentModeId")
                 if cid:
@@ -1287,7 +1368,7 @@ class DevinSession:
         """Ledger first. If the platform offers no allow option, deny is
         the only honest answer. With BRIDGE_AUTO_APPROVE (default) the
         request is answered locally, preferring allow_always. Otherwise
-        the request stays pending for a human '允许'/'拒绝' in the
+        the request stays pending for a human L("允许", "allow")/L("拒绝", "deny") in the
         owning thread; the prompt loop auto-denies after PERM_TIMEOUT."""
         params = msg.get("params") or {}
         tool_call = params.get("toolCall") or {}
@@ -1318,9 +1399,9 @@ class DevinSession:
                              resolution="cancelled",
                              resolver="no_allow_option",
                              needs_user=True)
-            self._note("审批无允许项，已回绝")
+            self._note(L("审批无允许项，已回绝", "approval had no allowable item, denied"))
             if self.notify:
-                self.notify("⚠️ 审批请求无可允许项，已回绝：" + summary)
+                self.notify(L("⚠️ 审批请求无可允许项，已回绝：", "⚠️ Approval request has no allowable item, denied:") + summary)
             return
         if AUTO_APPROVE:
             pick = next((o for o in allows
@@ -1333,7 +1414,7 @@ class DevinSession:
                              resolution=str(pick.get("kind", "allow")),
                              resolver="auto_approve",
                              needs_user=False)
-            self._note(f"已自动批准: {summary}")
+            self._note(L(f"已自动批准: {summary}", f"auto-approved: {summary}"))
             return
         entry = {
             "session_id": params.get("sessionId"),
@@ -1344,7 +1425,7 @@ class DevinSession:
             "msg_ts": None,
         }
         self.pending_perms[msg["id"]] = entry
-        self._note("等待人工审批")
+        self._note(L("等待人工审批", "waiting for human approval"))
         if self.notify_perm:
             try:
                 entry["msg_ts"] = self.notify_perm(
@@ -1352,9 +1433,9 @@ class DevinSession:
             except Exception:
                 entry["msg_ts"] = None
         if entry["msg_ts"] is None and self.notify:
-            self.notify(f"⚠️ 待审批 {msg['id']}: {summary}\n"
-                        "回复「允许」批准（优先 allow_once），"
-                        "「拒绝」回绝；"
+            self.notify(L(f"⚠️ 待审批 {msg['id']}: {summary}\\n", f"⚠️ pending approval {msg['id']}: {summary}\n") +
+                        L("回复「允许」批准（优先 allow_once），", 'reply "allow" to approve (prefers allow_once),') +
+                        L("「拒绝」回绝；", '"deny" to reject;') +
                         f"{_perm_timeout_hint()}。")
 
     def _answer_perm(self, rid, allow):
@@ -1397,8 +1478,8 @@ class DevinSession:
             try:
                 self.perm_update(
                     entry["msg_ts"],
-                    f"{mark} {entry.get('summary', '')}\n已由 "
-                    f"{who or '人工'} {'批准' if allow else '回绝'}"
+                    L(f"{mark} {entry.get('summary', '')}\\n已由 ", f"{mark} {entry.get('summary', '')}\nby ") +
+                    L(f"{who or '人工'} {'批准' if allow else '回绝'}", f"{who or 'human'} {'approved' if allow else 'denied'}") +
                     f"（{resolution}）")
             except Exception:
                 pass
@@ -1437,7 +1518,7 @@ class DevinSession:
                     try:
                         self.perm_update(
                             entry["msg_ts"],
-                            f"⏰ 超时自动拒绝：{entry.get('summary', '')}")
+                            L(f"⏰ 超时自动拒绝：{entry.get('summary', '')}", f"⏰ timed out, auto-denied: {entry.get('summary', '')}"))
                     except Exception:
                         pass
                 resolve_approval(self.workdir, rid,
@@ -1446,7 +1527,7 @@ class DevinSession:
                                  resolver="timeout",
                                  needs_user=True)
                 if self.notify:
-                    self.notify(f"⏰ 审批超时未答复，已回绝 {rid}。")
+                    self.notify(L(f"⏰ 审批超时未答复，已回绝 {rid}。", f"⏰ approval timed out unanswered, denied {rid}."))
 
     def _close_pending(self, resolver):
         for rid, entry in list(self.pending_perms.items()):
@@ -1505,9 +1586,9 @@ class DevinSession:
             key = _acp_api_key()
             if not key:
                 raise AcpError({
-                    "message": "devin 未认证: acp 不使用本地 CLI 凭据,"
-                               "且未找到 api key。请 `devin auth login` "
-                               "刷新凭据,或在桥环境设 DEVIN_ACP_API_KEY。"})
+                    "message": L("devin 未认证: acp 不使用本地 CLI 凭据,", "devin not authenticated: acp doesn't use local CLI credentials,") +
+                               L("且未找到 api key。请 `devin auth login` ", "and no api key found. Please `devin auth login` ") +
+                               L("刷新凭据,或在桥环境设 DEVIN_ACP_API_KEY。", "to refresh credentials, or set DEVIN_ACP_API_KEY in the bridge env.")})
             a = self._request("authenticate", {
                 "methodId": auth_methods[0].get("id", "devin-browser"),
                 "_meta": {"api_key": key}})
@@ -1539,10 +1620,10 @@ class DevinSession:
             if "error" in (res or {}) and "not authenticated" in \
                     str(res["error"].get("message", "")):
                 raise AcpError({
-                    "message": "devin 认证失效: acp 拒绝了 session/new。"
-                               "请 `devin auth login` 重新登录刷新凭据"
-                               "(桥下次启动会话会自动捡起),或换一个未"
-                               "限额的账号。"})
+                    "message": L("devin 认证失效: acp 拒绝了 session/new。", "devin auth expired: acp refused session/new.") +
+                               L("请 `devin auth login` 重新登录刷新凭据", "run `devin auth login` to refresh credentials") +
+                               L("(桥下次启动会话会自动捡起),或换一个未", "(the bridge will pick it up at next session start), or use an un") +
+                               L("限额的账号。", "limited account.")})
             self.session_id = res["result"]["sessionId"]
         self._note_session_meta((res or {}).get("result") or {})
         if SESSION_MODE:
@@ -1550,7 +1631,7 @@ class DevinSession:
                               {"sessionId": self.session_id,
                                "modeId": SESSION_MODE})
             self._wait_result(m, deadline, lambda x: None)
-        self._note("会话就绪")
+        self._note(L("会话就绪", "session ready"))
         write_state(self.workdir, "idle", self.last_activity,
                     extra={"session_id": self.session_id})
         # session/load replays history as session/update chunks; drop
@@ -1599,7 +1680,7 @@ class DevinSession:
                     self.last_shown = None
                     self.think_chunks = []
                     self.think_buf = ""
-                self._note("处理中")
+                self._note(L("处理中", "working"))
                 write_state(self.workdir, "running", self.last_activity)
                 try:
                     if inflight_id is not None:
@@ -1622,7 +1703,7 @@ class DevinSession:
                         now = time.monotonic()
                         if cancel_deadline is not None and \
                                 now > cancel_deadline:
-                            raise StopStalled("cancel 未在宽限内生效")
+                            raise StopStalled(L("cancel 未在宽限内生效", "cancel didn't take effect within grace"))
                         deadline = self.last_activity_at + self.timeout
                         if stall_deadline is not None:
                             deadline = min(deadline, stall_deadline)
@@ -1677,7 +1758,7 @@ class DevinSession:
                             if "error" in msg:
                                 raise AcpError(msg["error"])
                             return ("".join(self.chunks).strip()
-                                    or "(无输出)",
+                                    or L("(无输出)", "(no output)"),
                                     "interrupted" if interrupted else
                                     msg["result"].get("stopReason",
                                                       "?"))
@@ -1850,7 +1931,7 @@ class SessionBridge:
             self._err_last[key] = (last, count + 1)
             return
         self._err_last[key] = (now, 0)
-        tail = f"（60s 内另 {count} 次相同）" if count else ""
+        tail = L(f"（60s 内另 {count} 次相同）", f"({count} more identical within 60s)") if count else ""
         print(f"[error] {label}: {_errname(e)}{tail}", flush=True)
 
     @staticmethod
@@ -1949,7 +2030,7 @@ class SessionBridge:
                                     str(g.get("status", "?")))
             meta = f"{st} · turn {g.get('turns', '?')}"
             if s.goal_started_at:
-                meta += " · 已跑 " + _dur(
+                meta += L(" · 已跑 ", " · ran ") + _dur(
                     time.monotonic() - s.goal_started_at)
             lines.append(f"🎯 {obj}\n{meta}")
         info = " · ".join(x for x in (s.model_name, s.mode_name) if x)
@@ -1972,12 +2053,12 @@ class SessionBridge:
                          if p.startswith(s.workdir) else p
                          for p in sorted(s.touched)]
                 shown = names[:5]
-                more = (f" 等{len(names)}个" if len(names) > 5 else "")
+                more = (L(f" 等{len(names)}个", f" and {len(names)} more") if len(names) > 5 else "")
                 lines.append("📁 " + ", ".join(f"`{n}`" for n in shown)
                              + more)
         else:
-            head = ("⏸ 打断中" if s.interrupting else
-                    "🛑 停止中" if s.stopping else "⏳ 处理中")
+            head = (L("⏸ 打断中", "⏸ Interrupting") if s.interrupting else
+                    L("🛑 停止中", "🛑 Stopping") if s.stopping else L("⏳ 处理中", "⏳ Working"))
             if s.turn_started:
                 head += " · " + _dur(time.monotonic() - s.turn_started)
             if s.tool_count:
@@ -1997,7 +2078,7 @@ class SessionBridge:
                                  + (f"*{txt}*" if st == "in_progress"
                                     else txt))
                 if len(s.plan_entries) > 4:
-                    lines.append(f"· …{len(s.plan_entries) - 4} 项")
+                    lines.append(L(f"· …{len(s.plan_entries) - 4} 项", f"· …{len(s.plan_entries) - 4} more"))
             else:
                 trail = list(s.recent)[-3:]
                 if len(s.recent) > 3:
@@ -2021,12 +2102,12 @@ class SessionBridge:
             {"type": "actions", "block_id": "ctl",
              "elements": [
                  {"type": "button",
-                  "text": {"type": "plain_text", "text": "🛑 停止"},
+                  "text": {"type": "plain_text", "text": L("🛑 停止", "🛑 Stop")},
                   "action_id": "ctl_stop",
                   "value": "stop",
                   "style": "danger"},
                  {"type": "button",
-                  "text": {"type": "plain_text", "text": "📋 状态"},
+                  "text": {"type": "plain_text", "text": L("📋 状态", "📋 Status")},
                   "action_id": "ctl_status",
                   "value": "status"}]},
         ]
@@ -2116,9 +2197,9 @@ class SessionBridge:
         if len(text) > THINK_POST_MAX:
             head = THINK_POST_MAX * 2 // 5
             text = (text[:head].rstrip() +
-                    "\n…（中间省略）…\n" +
+                    L("\\n…（中间省略）…\\n", "\n…(middle omitted)…\n") +
                     text[-(THINK_POST_MAX - head):].lstrip())
-        self.post(ts, "🧠 *思路*\n" +
+        self.post(ts, L("🧠 *思路*\\n", "🧠 *Thinking*\n") +
                   "\n".join("> " + line for line in text.splitlines()))
 
     def _final_reply(self, ts, s, reply):
@@ -2128,7 +2209,7 @@ class SessionBridge:
         if s.draft_msgs:
             self._draft_final(ts, s)
         else:
-            self.post_long(ts, reply or "(无输出)")
+            self.post_long(ts, reply or L("(无输出)", "(no output)"))
 
     def _progress(self, ts):
         def cb(activity):
@@ -2178,13 +2259,13 @@ class SessionBridge:
                     return
                 resumes += 1
                 if resumes > GOAL_RESUME_MAX:
-                    self.post(ts, f"🎯 已自动续跑 {GOAL_RESUME_MAX} 段，"
-                                  "暂停自动 resume；发 !goal resume "
-                                  "手动继续。")
+                    self.post(ts, L(f"🎯 已自动续跑 {GOAL_RESUME_MAX} 段，", f"🎯 auto-resumed {GOAL_RESUME_MAX} segments;") +
+                                  L("暂停自动 resume；发 !goal resume ", "auto-resume paused; send !goal resume ") +
+                                  L("手动继续。", "to continue manually."))
                     return
-                self.post(ts, f"🎯 目标已跑 {g.get('turns', '?')} turn "
-                              f"暂停，自动续跑（第 {resumes} 段）…")
-                self._status_line(s, self._status_text(s, "目标续跑中"))
+                self.post(ts, L(f"🎯 目标已跑 {g.get('turns', '?')} turn ", f"🎯 goal has run {g.get('turns', '?')} turns ") +
+                              L(f"暂停，自动续跑（第 {resumes} 段）…", f"paused, auto-resuming (segment {resumes})…"))
+                self._status_line(s, self._status_text(s, L("目标续跑中", "goal resuming")))
                 seg_start = time.time()
                 reply, reason = s.prompt("/goal resume",
                                          self._progress(ts), flag)
@@ -2224,9 +2305,9 @@ class SessionBridge:
                         os.rename(path, path + ".attached")
                     except OSError:
                         pass
-                    self.post(ts, f"🎯 忽略疑似会话自建的目标文件 "
-                                  f"{name}（回合刚结束）；人工挂目标"
-                                  "请在空闲后重写该文件。")
+                    self.post(ts, L(f"🎯 忽略疑似会话自建的目标文件 ", f"🎯 ignoring a goal file the session seems to have self-created ") +
+                                  L(f"{name}（回合刚结束）；人工挂目标", f"{name} (turn just ended); manual goal attach") +
+                                  L("请在空闲后重写该文件。", "please rewrite the file once it's idle."))
                     return
                 with open(path, encoding="utf-8",
                           errors="replace") as f:
@@ -2243,7 +2324,7 @@ class SessionBridge:
                 os.rename(path, path + ".attached")
             except OSError:
                 continue
-            self.post(ts, f"🎯 检测到 {name}，挂为原生 goal："
+            self.post(ts, L(f"🎯 检测到 {name}，挂为原生 goal：", f"🎯 detected {name}, attaching as native goal:") +
                           f"{obj.splitlines()[0][:80]}")
             threading.Thread(target=self._run_prompt,
                              args=(ts, "/goal " + obj[:4000]),
@@ -2334,8 +2415,8 @@ class SessionBridge:
             if time.monotonic() > deadline:
                 break
             self._react_state(d["ts"], REACT_RELOADING)
-            self.post(d["ts"], "🔄 桥服务热重启：会话与生成中的内容"
-                               "保持，几秒后接管…")
+            self.post(d["ts"], L("🔄 桥服务热重启：会话与生成中的内容", "🔄 Bridge hot restart: sessions and in-flight content") +
+                               L("保持，几秒后接管…", "kept, taking over in a few seconds…"))
         os.execv(sys.executable, [sys.executable] + sys.argv)
 
     def reload_term(self):
@@ -2351,7 +2432,7 @@ class SessionBridge:
             if time.monotonic() > deadline:
                 break
             self._react_state(d["ts"], REACT_RELOADING)
-            self.post(d["ts"], "🔄 桥服务重启：会话保持，新进程接管…")
+            self.post(d["ts"], L("🔄 桥服务重启：会话保持，新进程接管…", "🔄 Bridge restarting: session kept, new process taking over…"))
 
     def _fdstore_push(self, recs):
         """sd_notify FDSTORE: systemd holds the fds across a full
@@ -2425,7 +2506,7 @@ class SessionBridge:
             s.chunks = list(d.get("chunks") or [])
             s.draft_msgs = list(d.get("draft_msgs") or [])
             s.draft_sent = list(d.get("draft_sent") or [])
-            s.last_activity = d.get("last_activity") or "处理中"
+            s.last_activity = d.get("last_activity") or L("处理中", "working")
             s.last_turn_end = d.get("last_turn_end") or 0.0
             s.notify = lambda msg, t=ts: self.post(t, msg)
             s.on_text = lambda t=ts: self._draft_tick(t)
@@ -2461,10 +2542,10 @@ class SessionBridge:
                              inflight_replay=True)
         if not turns:
             # Silent takeover: the pre-exec post already announced
-            # "几秒后接管", and main() posts one channel-level
+            # L("几秒后接管", "taking over in seconds"), and main() posts one channel-level
             # summary — a per-thread line here is pure noise.
             write_state(s.workdir, "idle", s.last_activity,
-                        "桥热重启，会话保持")
+                        L("桥热重启，会话保持", "bridge hot restart, session kept"))
 
     def adopt_inflight(self, skip=()):
         """Hard-death replay: workdirs whose last write recorded a
@@ -2490,7 +2571,7 @@ class SessionBridge:
             ts = ".".join(name.rsplit("_", 1))
             adopted.add(wd)
             self._react_state(ts, REACT_RELOADING)
-            self.post(ts, "🔄 恢复重启前未完成的回合…")
+            self.post(ts, L("🔄 恢复重启前未完成的回合…", "🔄 Resuming the turn interrupted by restart…"))
             threading.Thread(
                 target=self._resume_session,
                 args=(ts, inf["text"], None, st["session_id"]),
@@ -2525,9 +2606,9 @@ class SessionBridge:
                 with self.lock:
                     self.starting.discard(ts)
                     self.starting_auto.discard(ts)
-                self.post(ts, "排队任务已取消（该线程任务已停止或重置）。")
+                self.post(ts, L("排队任务已取消（该线程任务已停止或重置）。", "queued task cancelled (this thread's task was stopped or reset)."))
                 continue
-            self.post(ts, "轮到本任务，开始处理。")
+            self.post(ts, L("轮到本任务，开始处理。", "your turn — working on it now."))
             threading.Thread(target=self._new_session,
                              args=(ts, text, files),
                              kwargs={"queued": True},
@@ -2542,11 +2623,11 @@ class SessionBridge:
             if getattr(s, "auto", False) and not s.running:
                 dead = s.terminate()
                 write_state(s.workdir, "reaped", s.last_activity,
-                            "空闲回收，给排队任务让位")
+                            L("空闲回收，给排队任务让位", "idle reaped to make room for the queued task"))
                 self._remove(ts)
-                self._finish(ts, s, "zzz", "💤 空闲回收")
-                self.post(ts, "任务已完成；空闲会话回收以运行排队任务"
-                              + ("" if dead else "（进程退出未确认）")
+                self._finish(ts, s, "zzz", L("💤 空闲回收", "💤 Idle reaped"))
+                self.post(ts, L("任务已完成；空闲会话回收以运行排队任务", "task done; idle session reaped to run queued task")
+                              + ("" if dead else L("（进程退出未确认）", "(process exit unconfirmed)"))
                               + "。")
 
     # ---- limit governor -------------------------------------------
@@ -2568,14 +2649,14 @@ class SessionBridge:
         reset_at = info.get("reset_at")
         if reset_at and reset_at > now:
             resume_at = reset_at + random.uniform(2, 12)
-            wait_for = ("到 "
+            wait_for = (L("到 ", "at ")
                         + time.strftime("%H:%M",
                                         time.localtime(resume_at)))
         else:
             delay = limit_governor.backoff(attempt, LIMIT_BASE_BACKOFF,
                                            LIMIT_BACKOFF_CAP)
             resume_at = now + delay
-            wait_for = f"约 {_dur(delay)} 后"
+            wait_for = L(f"约 {_dur(delay)} 后", f"in ~{_dur(delay)}")
         live = sum(1 for x in self.sessions.values() if x.alive)
         active = sum(1 for x in self.sessions.values() if x.running)
         self.governor.park(ts, {
@@ -2586,14 +2667,14 @@ class SessionBridge:
             "attempt": attempt, "acct": _acct_fingerprint(),
             "live_sessions": live, "active_turns": active})
         write_state(s.workdir, "rate_limited", s.last_activity,
-                    f"{info['kind']}，{wait_for}自动重试"
-                    f"（第 {attempt} 次）")
+                    L(f"{info['kind']}，{wait_for}自动重试", f"{info['kind']}, auto-retry {wait_for}") +
+                    L(f"（第 {attempt} 次）", f"(attempt {attempt})"))
         self._react_state(ts, REACT_LIMITED)
-        self._status_line(s, f"⏸️ 限额冷却 · {wait_for}自动重试")
-        self.post(ts, f"⏸️ 触发服务端限额（{info['kind']}），本回合挂起，"
-                      f"{wait_for}自动重试"
-                      f"（第 {attempt}/{LIMIT_RESUME_MAX} 次）。"
-                      "回复任意消息立即重试；`!limits` 看冷却队列。")
+        self._status_line(s, L(f"⏸️ 限额冷却 · {wait_for}自动重试", f"⏸️ limit cooldown · auto-retry {wait_for}"))
+        self.post(ts, L(f"⏸️ 触发服务端限额（{info['kind']}），本回合挂起，", f"⏸️ hit a server-side limit ({info['kind']}); this turn is parked,") +
+                      L(f"{wait_for}自动重试", f"{wait_for} auto-retry") +
+                      L(f"（第 {attempt}/{LIMIT_RESUME_MAX} 次）。", f"(attempt {attempt}/{LIMIT_RESUME_MAX}).") +
+                      L("回复任意消息立即重试；`!limits` 看冷却队列。", "reply anything to retry now; `!limits` shows the cooldown queue."))
         self._board_touch()
         return True
 
@@ -2657,7 +2738,7 @@ class SessionBridge:
             return
         s = self.sessions.get(key)
         if s and s.alive:
-            self.post(key, "🔄 限额冷却结束，重试上一回合…")
+            self.post(key, L("🔄 限额冷却结束，重试上一回合…", "🔄 Cooldown over, retrying last turn…"))
             threading.Thread(
                 target=self._run_prompt,
                 args=(key, entry.get("text") or RESUME_NUDGE, None),
@@ -2876,8 +2957,8 @@ class SessionBridge:
             self.limit_attempts.pop("ext:" + sid, None)
             if LIMIT_EXT_POST:
                 title = _first_line(entry.get("title")) or sid
-                self.post(None, "🔄 限额恢复：桌面/CLI 会话 "
-                                f"`{sid}`（{title}）已自动续跑。")
+                self.post(None, L("🔄 限额恢复：桌面/CLI 会话 ", "🔄 Limit lifted: Desktop/CLI session ") +
+                                L(f"`{sid}`（{title}）已自动续跑。", f"`{sid}` ({title}) auto-resumed."))
         except Exception as e:
             info = limit_governor.classify_error(e)
             if info and entry.get("attempt", 1) < LIMIT_RESUME_MAX:
@@ -2943,38 +3024,38 @@ class SessionBridge:
     def _limits(self, root, arg=""):
         """!limits: cooldown queue + recent limit events, or drop this
         thread's parked turn with `!limits clear`."""
-        if (arg or "").strip().lower() in ("clear", "drop", "取消"):
+        if (arg or "").strip().lower() in ("clear", "drop", L("取消", "cancel")):
             e = self.governor.pop(root, "manual_clear")
-            self.post(root, "已取消本线程的限额重试。" if e
-                      else "本线程没有在冷却的回合。")
+            self.post(root, L("已取消本线程的限额重试。", "cancelled this thread's limit retries.") if e
+                      else L("本线程没有在冷却的回合。", "no cooling-down turns on this thread."))
             return
         parked = self.governor.snapshot()
         now = time.time()
         lines = []
         if parked:
-            lines.append("*冷却队列*")
+            lines.append(L("*冷却队列*", "*Cooldown queue*"))
             for e in parked:
                 if e.get("kind") == "external":
-                    who = "桌面/CLI"
+                    who = L("桌面/CLI", "Desktop/CLI")
                 elif e["key"] == root:
-                    who = "本线程"
+                    who = L("本线程", "this thread")
                 else:
-                    who = f"线程 {e['key']}"
+                    who = L(f"线程 {e['key']}", f"thread {e['key']}")
                 if e.get("suspect"):
-                    when = ("前端仍占锁，仅观察（steal=1 可接管）"
-                            if not LIMIT_EXT_STEAL else "等待接管")
+                    when = (L("前端仍占锁，仅观察（steal=1 可接管）", "frontend still holds the lock, watching only (steal=1 to take over)")
+                            if not LIMIT_EXT_STEAL else L("等待接管", "awaiting takeover"))
                 else:
                     wait = int(e.get("resume_at", 0) - now)
-                    when = f"{wait}s 后重试" if wait > 0 else "待调度"
+                    when = L(f"{wait}s 后重试", f"retry in {wait}s") if wait > 0 else L("待调度", "pending")
                 lines.append(
-                    f"• {who} `{e.get('session_id') or '?'}` "
-                    f"{e.get('error_kind')} · 第 "
-                    f"{e.get('attempt', '?')} 次 · {when}")
+                    f"• {who} `{e.get('session_id') or '?'}` " +
+                    L(f"{e.get('error_kind')} · 第 ", f"{e.get('error_kind')} · attempt ") +
+                    L(f"{e.get('attempt', '?')} 次 · {when}", f"attempt {e.get('attempt', '?')} · {when}"))
         else:
-            lines.append("冷却队列是空的。")
+            lines.append(L("冷却队列是空的。", "cooldown queue is empty."))
         evs = self.governor.events_tail(8)
         if evs:
-            lines.append("*最近限额事件*")
+            lines.append(L("*最近限额事件*", "*Recent limit events*"))
             for e in evs:
                 t = time.strftime("%H:%M:%S",
                                   time.localtime(e.get("t", 0)))
@@ -2996,9 +3077,9 @@ class SessionBridge:
             try:
                 os.makedirs(os.path.dirname(mem), exist_ok=True)
                 with open(mem, "w") as f:
-                    f.write("# 跨会话记忆\n\n记录需要长期记住的事实、"
-                            "偏好、决定与关键路径。按日期小节追加，"
-                            "保持精简。\n")
+                    f.write(L("# 跨会话记忆\\n\\n记录需要长期记住的事实、", "# Cross-session memory\n\nDurable facts to remember:") +
+                            L("偏好、决定与关键路径。按日期小节追加，", "preferences, decisions, key paths. Append under date headings,") +
+                            L("保持精简。\\n", "keep it concise.\n"))
             except OSError:
                 pass
         agents = os.path.join(workdir, "AGENTS.md")
@@ -3024,7 +3105,7 @@ class SessionBridge:
             name = re.sub(r"[^\w.一-鿿-]+", "_",
                           f.get("name") or f.get("id") or "file")
             if not url:
-                out.append(f"[附件 {name}: 无下载地址]")
+                out.append(L(f"[附件 {name}: 无下载地址]", f"[attachment {name}: no download url]"))
                 continue
             dest = os.path.join(inbox, name)
             try:
@@ -3033,9 +3114,9 @@ class SessionBridge:
                 with urllib.request.urlopen(req, timeout=60) as r, \
                         open(dest, "wb") as w:
                     shutil.copyfileobj(r, w)
-                out.append(f"[附件已存] {dest}")
+                out.append(L(f"[附件已存] {dest}", f"[attachment saved] {dest}"))
             except Exception as e:
-                out.append(f"[附件 {name} 下载失败: {type(e).__name__}]")
+                out.append(L(f"[附件 {name} 下载失败: {type(e).__name__}]", f"[attachment {name} download failed: {type(e).__name__}]"))
         return out
 
     def _collect_sendables(self, s, reply, since):
@@ -3161,9 +3242,9 @@ class SessionBridge:
                         time.sleep(1.5 * (attempt + 1))
                         continue
                     self._log_err(f"upload {p}", e)
-                    self.post(ts, f"📎 文件发送失败 "
-                                  f"{os.path.basename(p)} "
-                                  f"({_errname(e)})，路径: {p}")
+                    self.post(ts, L(f"📎 文件发送失败 ", f"📎 file send failed ") +
+                                  f"{os.path.basename(p)} " +
+                                  L(f"({_errname(e)})，路径: {p}", f"({_errname(e)}), path: {p}"))
                     break
         if pending:
             s.pending_files = list(
@@ -3171,10 +3252,10 @@ class SessionBridge:
                               + pending))
             names = ", ".join(f"`{os.path.basename(p)}`"
                               for p in pending[:4])
-            more = (f" 等{len(pending)}个" if len(pending) > 4 else "")
-            self.post(ts, f"📁 还有新文件没发：{names}{more} — "
-                          "`!files` 看全部，`!send <名字>` 或 "
-                          "`!send all` 拉取。")
+            more = (L(f" 等{len(pending)}个", f" and {len(pending)} more") if len(pending) > 4 else "")
+            self.post(ts, L(f"📁 还有新文件没发：{names}{more} — ", f"📁 new files not sent: {names}{more} — ") +
+                          L("`!files` 看全部，`!send <名字>` 或 ", "`!files` lists all, `!send <name>` or ") +
+                          L("`!send all` 拉取。", "`!send all` pulls everything."))
 
     _SKIP_DIRS = ("inbox", "node_modules", "__pycache__", "dist",
                   ".git", ".venv", "venv")
@@ -3205,7 +3286,7 @@ class SessionBridge:
         pend = {os.path.realpath(p) for p in
                 getattr(s, "pending_files", [])
                 if os.path.isfile(p)} if s else set()
-        lines = ["📁 *本线程可取的文件*"]
+        lines = [L("📁 *本线程可取的文件*", "📁 *Files available in this thread*")]
         shown = 0
         seen = set()
         for p in sorted(pend, key=lambda p: -os.path.getmtime(p)) + \
@@ -3214,33 +3295,33 @@ class SessionBridge:
             if rp in seen:
                 continue
             seen.add(rp)
-            mark = "（未发）" if rp in pend else \
-                   ("（已发过）" if rp in sent else "")
+            mark = L("（未发）", "(unsent)") if rp in pend else \
+                   (L("（已发过）", "(sent)") if rp in sent else "")
             lines.append(f"• `{os.path.basename(p)}`{mark}")
             shown += 1
             if shown >= 15:
                 lines.append("• …")
                 break
         if not shown:
-            lines.append("（还没有产出文件）")
-        lines.append("发 `!send <名字>` 拉单个，`!send all` 全拉。")
+            lines.append(L("（还没有产出文件）", "(no files produced yet)"))
+        lines.append(L("发 `!send <名字>` 拉单个，`!send all` 全拉。", "`!send <name>` pulls one, `!send all` pulls all."))
         self.post(root, "\n".join(lines))
 
     def _send_named(self, root, arg):
-        """!send <名|路径|all> — pull files on demand."""
+        """!send <name|path|all> — pull files on demand."""
         s = self.sessions.get(root)
         name = (arg or "").strip().strip("`").strip('"').strip("'")
         if not name:
-            self.post(root, "用法：`!send <文件名|路径>` 或 `!send all`"
-                            "（`!files` 先看有什么）。")
+            self.post(root, L("用法：`!send <文件名|路径>` 或 `!send all`", "usage: `!send <filename|path>` or `!send all`") +
+                            L("（`!files` 先看有什么）。", "(see `!files` first)."))
             return
         if name.lower() == "all":
             if s is None:
-                self.post(root, "没有待发文件。")
+                self.post(root, L("没有待发文件。", "no files waiting to send."))
                 return
             pend = [p for p in s.pending_files if os.path.isfile(p)]
             if not pend:
-                self.post(root, "没有待发文件。")
+                self.post(root, L("没有待发文件。", "no files waiting to send."))
                 return
             ok_ = 0
             for p in pend:
@@ -3252,7 +3333,7 @@ class SessionBridge:
                     self._log_err(f"upload {p}", e)
             s.pending_files = [p for p in s.pending_files
                                if p not in pend]
-            self.post(root, f"📎 已发 {ok_}/{len(pend)} 个文件。")
+            self.post(root, L(f"📎 已发 {ok_}/{len(pend)} 个文件。", f"📎 sent {ok_}/{len(pend)} files."))
             return
         cands = []
         if os.path.isabs(name) and os.path.isfile(name):
@@ -3272,8 +3353,8 @@ class SessionBridge:
                     cands += [os.path.join(dirpath, n) for n in names
                               if n == name]
         if not cands:
-            self.post(root, f"没找到 `{name}`——`!files` "
-                            "看可取的文件。")
+            self.post(root, L(f"没找到 `{name}`——`!files` ", f"`{name}` not found — `!files` ") +
+                            L("看可取的文件。", "to see available files."))
             return
         p = os.path.realpath(cands[0])
         try:
@@ -3284,7 +3365,7 @@ class SessionBridge:
                                    if os.path.realpath(q) != p]
         except Exception as e:
             self._log_err(f"upload {p}", e)
-            self.post(root, f"📎 发 {os.path.basename(p)} 失败"
+            self.post(root, L(f"📎 发 {os.path.basename(p)} 失败", f"📎 failed to send {os.path.basename(p)}") +
                             f"({_errname(e)})。")
 
     def _ledger_user_msg(self, msg_ts, root_ts, text):
@@ -3327,8 +3408,8 @@ class SessionBridge:
                 except OSError:
                     pass
                 if goal_replay:
-                    self.post(ts, "目标是人工清除的，已跳过这次自动"
-                                  "重放；要重跑请重新发 !goal。")
+                    self.post(ts, L("目标是人工清除的，已跳过这次自动", "goal was cleared manually — skipped this auto") +
+                                  L("重放；要重跑请重新发 !goal。", "replay; to re-run, send !goal again."))
                     return
         if files:
             lines = self._save_inbound(s.workdir, files)
@@ -3350,9 +3431,9 @@ class SessionBridge:
                     if status_stop.is_set():
                         return
                     self._set_thread_status(
-                        ts, s.last_shown or "处理中…")
+                        ts, s.last_shown or L("处理中…", "working…"))
         if self.status_msg:
-            self._set_thread_status(ts, "处理中…")
+            self._set_thread_status(ts, L("处理中…", "working…"))
             threading.Thread(target=status_keepalive, daemon=True).start()
         turn_start = time.time()
         try:
@@ -3367,44 +3448,44 @@ class SessionBridge:
             self.crash_retries.pop(ts, None)
             self.limit_attempts.pop(ts, None)
             write_state(s.workdir, "idle", s.last_activity,
-                        "任务已取消" if reason in
+                        L("任务已取消", "task cancelled") if reason in
                         ("cancelled", "queued_cancelled")
-                        else "任务被打断" if reason == "interrupted"
-                        else "上一任务已完成")
+                        else L("任务被打断", "task interrupted") if reason == "interrupted"
+                        else L("上一任务已完成", "previous task completed"))
             if reason in ("cancelled", "queued_cancelled",
                           "interrupted"):
                 interrupted = reason == "interrupted"
                 if interrupted:
                     self._finish(ts, s, "double_vertical_bar",
-                                 "⏸ 已打断")
+                                 L("⏸ 已打断", "⏸ Interrupted"))
                 else:
-                    self._finish(ts, s, "octagonal_sign", "🛑 已停止")
+                    self._finish(ts, s, "octagonal_sign", L("🛑 已停止", "🛑 Stopped"))
                 self._post_think(ts, s)
                 # Work produced before the cut-off still belongs in
                 # the thread — send files on interrupted turns too.
                 self._send_files(ts, s, reply, turn_start)
                 if reason == "queued_cancelled":
-                    self.post(ts, "（排队中已取消）")
+                    self.post(ts, L("（排队中已取消）", "(cancelled while queued)"))
                 elif interrupted:
                     self.post(ts, (reply + "\n" if reply else "")
-                              + "（已打断，接着处理新消息）")
+                              + L("（已打断，接着处理新消息）", "(interrupted, now handling your new message)"))
                 else:
                     self.post(ts, (reply + "\n" if reply else "")
-                              + "（已停止）")
+                              + L("（已停止）", "(stopped)"))
             else:
                 self._final_reply(ts, s, reply)
                 self._send_files(ts, s, reply, turn_start)
                 self._goal_drive(ts, s, flag)
                 write_state(s.workdir, "idle", s.last_activity,
-                            "上一任务已完成")
-                self._finish(ts, s, "white_check_mark", "✅ 完成")
+                            L("上一任务已完成", "previous task completed"))
+                self._finish(ts, s, "white_check_mark", L("✅ 完成", "✅ Done"))
         except StopStalled as e:
             dead = s.terminate()
             write_state(s.workdir, "stopped", s.last_activity, str(e))
             self._remove(ts)
-            self._finish(ts, s, "octagonal_sign", "🛑 已停止")
-            self.post(ts, "已停止（取消未响应，已强制结束该会话）。" if dead
-                      else "已发出停止并结束会话；进程退出未确认，请检查。")
+            self._finish(ts, s, "octagonal_sign", L("🛑 已停止", "🛑 Stopped"))
+            self.post(ts, L("已停止（取消未响应，已强制结束该会话）。", "stopped (cancel went unanswered; session force-ended).") if dead
+                      else L("已发出停止并结束会话；进程退出未确认，请检查。", "stop sent and session ended; process exit unconfirmed, please check."))
         except PromptTimeout:
             dead = s.terminate()
             sid = getattr(s, "session_id", None)
@@ -3416,20 +3497,20 @@ class SessionBridge:
                 self.crash_retries[ts] = \
                     self.crash_retries.get(ts, 0) + 1
                 write_state(s.workdir, "crashed", s.last_activity,
-                            "热重启后续等超时")
+                            L("热重启后续等超时", "post-hot-restart wait timed out"))
                 self._remove(ts)
-                self.post(ts, "热重启后回合失联，自动恢复会话并重跑…")
+                self.post(ts, L("热重启后回合失联，自动恢复会话并重跑…", "turn lost after hot restart; auto-restoring session and re-running…"))
                 self._resume_session(ts, text, files, sid,
                                      msg_ts=msg_ts, replayed=True)
                 return
             write_state(s.workdir, "timeout", s.last_activity,
-                        f"静默超过 {int(self.timeout)}s")
+                        L(f"静默超过 {int(self.timeout)}s", f"silent for {int(self.timeout)}s"))
             self._remove(ts)
             self._finish(ts, s, "alarm_clock",
-                         f"⏰ 静默 {int(self.timeout)}s",
-                         detail=f"无活动超过 {int(self.timeout)}s，"
-                                "判定卡死，会话已终止。" +
-                         ("" if dead else "（进程退出未确认，请检查）"))
+                         L(f"⏰ 静默 {int(self.timeout)}s", f"⏰ silent {int(self.timeout)}s"),
+                         detail=L(f"无活动超过 {int(self.timeout)}s，", f"no activity for {int(self.timeout)}s,") +
+                                L("判定卡死，会话已终止。", "judged stuck; session terminated.") +
+                         ("" if dead else L("（进程退出未确认，请检查）", "(process exit unconfirmed, please check)")))
         except AcpExited:
             s.terminate()
             write_state(s.workdir, "crashed", s.last_activity)
@@ -3441,15 +3522,15 @@ class SessionBridge:
                 # session in a fresh process and re-run this turn.
                 self.crash_retries[ts] = retries + 1
                 self._draft_final(ts, s)
-                self.post(ts, "devin 进程异常退出，自动恢复会话并重跑"
-                              "本轮…")
+                self.post(ts, L("devin 进程异常退出，自动恢复会话并重跑", "devin process exited unexpectedly; auto-restoring and re-running") +
+                              L("本轮…", "this turn…"))
                 self._resume_session(ts, text, files, sid, msg_ts=msg_ts,
                                      replayed=True)
             else:
-                self._finish(ts, s, "boom", "💥 进程退出",
-                             detail="devin 进程异常退出，会话已结束。"
+                self._finish(ts, s, "boom", L("💥 进程退出", "💥 process exited"),
+                             detail=L("devin 进程异常退出，会话已结束。", "devin process exited unexpectedly; session ended.")
                              if not retries else
-                             "自动恢复后再次退出，会话已结束。")
+                             L("自动恢复后再次退出，会话已结束。", "exited again after auto-restore; session ended."))
         except Exception as e:
             parked = (not flag.is_set()
                       and self._limit_park(ts, s, text, msg_ts, e))
@@ -3458,18 +3539,18 @@ class SessionBridge:
                 return
             write_state(s.workdir, "failed", s.last_activity,
                         f"{type(e).__name__}: {e}")
-            hint = ("；回复本线程任意消息可让它重试"
+            hint = (L("；回复本线程任意消息可让它重试", "; reply anything in this thread to retry")
                     if getattr(e, "retryable", False) else "")
             rl = re.search(
                 r"[Rr]ate limit.*?reset in ([^(]+)(?:\(at ([^)]+)\))?",
                 str(e))
             if rl:
-                detail = (f"模型限额，约 {rl.group(1).strip()} 后重置"
+                detail = (L(f"模型限额，约 {rl.group(1).strip()} 后重置", f"model rate limit, resets in ~{rl.group(1).strip()}")
                           + (f"（{rl.group(2)}）" if rl.group(2) else "")
-                          + "；回复本线程任意消息可让它重试。")
+                          + L("；回复本线程任意消息可让它重试。", "; reply anything in this thread to retry."))
             else:
                 detail = f"{type(e).__name__}: {e}{hint}"
-            self._finish(ts, s, "x", "❌ 出错", detail=detail)
+            self._finish(ts, s, "x", L("❌ 出错", "❌ Error"), detail=detail)
         finally:
             status_stop.set()
             with status_lock:
@@ -3486,7 +3567,7 @@ class SessionBridge:
             # Ack before the spawn+handshake, which can take many
             # seconds; silence reads as 'ignored me'. The ack becomes
             # the live status card below, not a second message.
-            ack_ts = self.post(ts, "已接单，开始处理。")
+            ack_ts = self.post(ts, L("已接单，开始处理。", "accepted, working on it."))
         s = None
         try:
             s = DevinSession(ts, wd, self.acp_cmd, self.timeout)
@@ -3501,7 +3582,7 @@ class SessionBridge:
                 s.terminate()
             write_state(wd, "failed", "", f"{type(e).__name__}: {e}")
             self._react_state(ts, "x")
-            self.post(ts, f"启动 devin 失败: {type(e).__name__}: {e}")
+            self.post(ts, L(f"启动 devin 失败: {type(e).__name__}: {e}", f"failed to start devin: {type(e).__name__}: {e}"))
             with self.lock:
                 self.starting.discard(ts)
                 self.starting_auto.discard(ts)
@@ -3539,7 +3620,7 @@ class SessionBridge:
                 except OSError:
                     pass
             if ack_post:
-                ack_ts = self.post(root, "已接单，正在恢复旧会话…")
+                ack_ts = self.post(root, L("已接单，正在恢复旧会话…", "accepted, restoring previous session…"))
             s = DevinSession(root, wd, self.acp_cmd, self.timeout)
             s.notify = lambda msg: self.post(root, msg)
             s.on_text = lambda: self._draft_tick(root)
@@ -3554,7 +3635,7 @@ class SessionBridge:
                         extra={"session_id": session_id})
             self._react_state(root, "x")
             hint = _stderr_hint(wd)
-            self.post(root, f"恢复会话失败: {type(e).__name__}: {e}"
+            self.post(root, L(f"恢复会话失败: {type(e).__name__}: {e}", f"failed to restore session: {type(e).__name__}: {e}")
                             + (f"（acp: {hint}）" if hint else ""))
             with self.lock:
                 self.starting.discard(root)
@@ -3567,8 +3648,8 @@ class SessionBridge:
                          daemon=True).start()
         # One receipt per resume: the ack is updated in place to the
         # outcome, so a clean restore leaves exactly one message.
-        outcome = ("已恢复旧会话，继续处理。" if s.resumed else
-                   "旧会话无法恢复（可能已被清理），已开新会话继续。")
+        outcome = (L("已恢复旧会话，继续处理。", "restored the previous session, continuing.") if s.resumed else
+                   L("旧会话无法恢复（可能已被清理），已开新会话继续。", "old session couldn't be restored (likely cleaned); started a fresh one."))
         if not (ack_ts and self._upd(ack_ts, outcome)):
             self.post(root, outcome)
         self._board_touch()
@@ -3587,30 +3668,30 @@ class SessionBridge:
                     self.dispatch_queue.remove(hit)
             if hit:
                 write_state(self._workdir(root), "stopped", "",
-                            "排队中取消")
-                self.post(root, "已取消排队，本任务不会执行。")
+                            L("排队中取消", "cancel while queued"))
+                self.post(root, L("已取消排队，本任务不会执行。", "queue cancelled; this task won't run."))
                 return
             if root in self.starting:
-                self.post(root, "会话正在启动，请稍候再发停止。")
+                self.post(root, L("会话正在启动，请稍候再发停止。", "session is starting, try stop again in a moment."))
                 return
             st = read_state(self._workdir(root))
-            tail = f"（上次：{fmt_state(st)}）" if st else ""
-            self.post(root, f"该线程没有运行中的会话{tail}。")
+            tail = L(f"（上次：{fmt_state(st)}）", f"(last: {fmt_state(st)})") if st else ""
+            self.post(root, L(f"该线程没有运行中的会话{tail}。", f"no running session on this thread{tail}."))
             return
         flag = self.stop_flags.setdefault(root, threading.Event())
         flag.set()
         had_goal, _ = self._goal_clear_full(s)
-        gnote = "（目标已一并清除）" if had_goal else ""
+        gnote = L("（目标已一并清除）", "(goal cleared too)") if had_goal else ""
         if not s.running:
             dead = s.terminate()
             write_state(s.workdir, "stopped", s.last_activity,
-                        "空闲时收到停止")
+                        L("空闲时收到停止", "stop received while idle"))
             self._remove(root)
-            self._finish(root, s, "octagonal_sign", "🛑 已停止")
-            self.post(root, "会话已停止。" + gnote +
-                      ("" if dead else "进程退出未确认，请检查。"))
+            self._finish(root, s, "octagonal_sign", L("🛑 已停止", "🛑 Stopped"))
+            self.post(root, L("会话已停止。", "session stopped.") + gnote +
+                      ("" if dead else L("进程退出未确认，请检查。", "process exit unconfirmed, please check.")))
         else:
-            self.post(root, "正在停止…" + gnote)
+            self.post(root, L("正在停止…", "stopping…") + gnote)
         self._pump_queue()
 
     def _goal_clear_rpc(self, s):
@@ -3674,14 +3755,14 @@ class SessionBridge:
         if s:
             had, killed = self._goal_clear_full(s)
             if had and killed:
-                self.post(root, "已清除目标，正在跑的目标回合并已叫停。")
+                self.post(root, L("已清除目标，正在跑的目标回合并已叫停。", "goal cleared; the running goal turn was also stopped."))
             elif had:
-                self.post(root, "已清除目标，自动续跑不会再拉起。")
+                self.post(root, L("已清除目标，自动续跑不会再拉起。", "goal cleared; auto-resume won't bring it back."))
             elif killed:
-                self.post(root, "目标已不在了；"
-                                "正在跑的目标回合也已叫停。")
+                self.post(root, L("目标已不在了；", "goal is gone;") +
+                                L("正在跑的目标回合也已叫停。", "the running goal turn was also stopped."))
             else:
-                self.post(root, "该会话当前没有挂着的目标。")
+                self.post(root, L("该会话当前没有挂着的目标。", "this session has no attached goal."))
             return
         removed = False
         for name in GOAL_FILES:
@@ -3694,55 +3775,55 @@ class SessionBridge:
                 except OSError:
                     pass
         _goal_mark_cleared(self._workdir(root))
-        self.post(root, "已清除待挂的目标文件。" if removed
-                  else "该线程没有活动会话，也没有目标文件。")
+        self.post(root, L("已清除待挂的目标文件。", "cleared the pending goal file.") if removed
+                  else L("该线程没有活动会话，也没有目标文件。", "no active session and no goal file on this thread."))
 
     def _pending_hint(self, root):
         records, _ = load_approvals(self._workdir(root))
         n = sum(1 for r in records if r.get("status") == "pending")
-        return f"，待审批 {n} 项" if n else ""
+        return L(f"，待审批 {n} 项", f", {n} pending approval(s)") if n else ""
 
     def _status(self, root):
         s = self.sessions.get(root)
         if s:
             ago = int(time.monotonic() - s.last_activity_at)
             if s.stopping:
-                state = "正在停止"
+                state = L("正在停止", "stopping")
             elif s.running:
-                state = "执行中"
+                state = L("执行中", "running")
             else:
-                state = "等待中（空闲）"
-            q = f"，排队 {s.queued} 条" if s.queued else ""
+                state = L("等待中（空闲）", "waiting (idle)")
+            q = L(f"，排队 {s.queued} 条", f", {s.queued} queued") if s.queued else ""
             info = " · ".join(x for x in (s.model_name, s.mode_name)
                               if x)
             sid = getattr(s, "session_id", None)
-            self.post(root, f"状态: {state}，最近活动: "
-                            f"{s.last_activity}（{ago} 秒前）{q}"
+            self.post(root, L(f"状态: {state}，最近活动: ", f"status: {state}, last activity: ") +
+                            L(f"{s.last_activity}（{ago} 秒前）{q}", f"{s.last_activity} ({ago}s ago){q}") +
                             f"{self._pending_hint(root)}"
                             + (f"，{info}" if info else ""))
             if sid:
-                self.post(root, f"会话 `{sid}`——桌面 `devin -r {sid}` "
-                                "可接管；`!handoff` 看详情。")
+                self.post(root, L(f"会话 `{sid}`——桌面 `devin -r {sid}` ", f"session `{sid}` — `devin -r {sid}` on desktop ") +
+                                L("可接管；`!handoff` 看详情。", "can be adopted; `!handoff` for details."))
             if s.goal:
                 g = s.goal
-                self.post(root, f"🎯 目标: "
+                self.post(root, L(f"🎯 目标: ", f"🎯 goal: ") +
                                 f"{(g.get('objective') or '')[:60]} "
                                 f"（{GOAL_STATUS_CN.get(g.get('status'), '?')}"
                                 f" · turn {g.get('turns', '?')}）")
             parked = self.governor.get(root)
             if parked:
                 wait = int(parked.get("resume_at", 0) - time.time())
-                self.post(root, "⏸️ 限额冷却中："
-                                + (f"{wait}s 后" if wait > 0 else "即将")
-                                + f"自动重试（第 "
-                                  f"{parked.get('attempt', '?')} 次）。")
+                self.post(root, L("⏸️ 限额冷却中：", "⏸️ Rate-limit cooldown:")
+                                + (L(f"{wait}s 后", f"in {wait}s") if wait > 0 else L("即将", "soon"))
+                                + L(f"自动重试（第 ", f"auto-retry (#") +
+                                  L(f"{parked.get('attempt', '?')} 次）。", f"{parked.get('attempt', '?')})."))
             return
         if root in self.starting:
-            self.post(root, "状态: 启动中")
+            self.post(root, L("状态: 启动中", "status: starting"))
             return
         st = read_state(self._workdir(root))
-        self.post(root, (f"状态: {fmt_state(st)}" if st
-                         else "状态: 未知（本服务无该线程记录）")
+        self.post(root, (L(f"状态: {fmt_state(st)}", f"status: {fmt_state(st)}") if st
+                         else L("状态: 未知（本服务无该线程记录）", "status: unknown (no record for this thread)"))
                   + self._pending_hint(root))
 
     def _decide(self, root, allow, ev):
@@ -3751,13 +3832,13 @@ class SessionBridge:
         try:
             res = s.user_decide(allow, who) if s else None
         except AcpExited:
-            self.post(root, "审批应答发送失败：会话进程已退出。")
+            self.post(root, L("审批应答发送失败：会话进程已退出。", "approval reply failed: session process exited."))
             return
         if not res:
-            self.post(root, "当前没有待审批的请求。")
+            self.post(root, L("当前没有待审批的请求。", "no pending approval requests."))
             return
         rid, resolution = res
-        self.post(root, f"已{'批准' if allow else '回绝'} "
+        self.post(root, L(f"已{'批准' if allow else '回绝'} ", f"{'approved' if allow else 'denied'} ") +
                         f"{rid}（{resolution}）。")
 
     def _approvals(self, root):
@@ -3767,7 +3848,7 @@ class SessionBridge:
         st = read_state(wd)
         records, ledger = load_approvals(wd)
         if st is None and ledger == "missing" and root not in self.sessions:
-            self.post(root, "该线程无会话与审批记录。")
+            self.post(root, L("该线程无会话与审批记录。", "no session or approval records on this thread."))
             return
         live = root in self.sessions or \
             (bool(st) and st.get("state") not in TERMINAL)
@@ -3779,30 +3860,30 @@ class SessionBridge:
                  if live and now - r.get("requested_at", 0) <= stale_sec]
         stale = [r for r in pend if r not in fresh]
         if ledger == "corrupt":
-            lines.append("审批台账损坏，无法确认是否有待审批。")
+            lines.append(L("审批台账损坏，无法确认是否有待审批。", "approval ledger corrupt; can't confirm pending approvals."))
         for r in fresh:
             waited = int(now - r.get("requested_at", now))
-            lines.append(f"⏳ 待审批 {r.get('request_id')}: "
-                         f"{r.get('summary')}（已等待 {waited}s，阻塞中）")
+            lines.append(L(f"⏳ 待审批 {r.get('request_id')}: ", f"⏳ pending approval {r.get('request_id')}: ") +
+                         L(f"{r.get('summary')}（已等待 {waited}s，阻塞中）", f"{r.get('summary')} (waiting {waited}s, blocked)"))
         if not fresh:
-            lines.append("无待审批（台账已核验）。" if ledger == "ok"
-                         else "无待审批（无台账文件，即未记录到任何请求）。")
+            lines.append(L("无待审批（台账已核验）。", "none pending (ledger verified).") if ledger == "ok"
+                         else L("无待审批（无台账文件，即未记录到任何请求）。", "none pending (no ledger file — nothing was recorded)."))
         for r in stale:
-            lines.append(f"⚠️ 待核实 {r.get('request_id')}: 记录停在待审批"
-                         "但会话已不活跃，决议未知。")
+            lines.append(L(f"⚠️ 待核实 {r.get('request_id')}: 记录停在待审批", f"⚠️ to verify {r.get('request_id')}: record stuck at pending") +
+                         L("但会话已不活跃，决议未知。", "but the session is no longer active; resolution unknown."))
         done = [r for r in records
                 if r.get("status") in ("resolved", "interrupted")]
         for r in [r for r in done if r.get("needs_user")][-3:]:
-            lines.append(f"需人工 {r.get('request_id')}: {r.get('summary')}"
+            lines.append(L(f"需人工 {r.get('request_id')}: {r.get('summary')}", f"needs human {r.get('request_id')}: {r.get('summary')}") +
                          f" → {r.get('resolution', '?')}")
         auto = [r for r in done if not r.get("needs_user")]
         if auto:
             r = auto[-1]
-            lines.append(f"最近自动放行 {r.get('request_id')}: "
-                         f"{r.get('summary')} → {r.get('resolution', '?')}；"
-                         f"累计 {len(auto)} 项")
-        lines.append("核验时间 " + time.strftime("%H:%M:%S")
-                     + f"，台账 {len(records)} 条。")
+            lines.append(L(f"最近自动放行 {r.get('request_id')}: ", f"recent auto-allowed {r.get('request_id')}: ") +
+                         f"{r.get('summary')} → {r.get('resolution', '?')}；" +
+                         L(f"累计 {len(auto)} 项", f"{len(auto)} total"))
+        lines.append(L("核验时间 ", "verified at ") + time.strftime("%H:%M:%S")
+                     + L(f"，台账 {len(records)} 条。", f", ledger has {len(records)} records."))
         self.post(root, "\n".join(lines))
 
     def _bang(self, root, cmd, arg, ev):
@@ -3816,7 +3897,7 @@ class SessionBridge:
             self._queue_status(root)
         elif cmd == "reload":
             self.request_reload()
-            self.post(root, "收到，桥服务热重启（在跑的会话不中断）。")
+            self.post(root, L("收到，桥服务热重启（在跑的会话不中断）。", "got it — bridge hot-restarting (running sessions unaffected)."))
         elif cmd == "help":
             self.post(root, HELP_CARD)
         elif cmd == "allow":
@@ -3846,17 +3927,22 @@ class SessionBridge:
             self._files_list(root)
         elif cmd == "send":
             self._send_named(root, arg)
-        elif cmd == "pad":
-            self._pad(root)
-        elif cmd == "shot":
-            threading.Thread(target=self._shot, args=(root,),
-                             daemon=True).start()
-        elif cmd == "type":
-            threading.Thread(target=self._inject_text, args=(root, arg),
-                             daemon=True).start()
-        elif cmd == "key":
-            threading.Thread(target=self._inject_key, args=(root, arg),
-                             daemon=True).start()
+        elif cmd in ("pad", "shot", "type", "key"):
+            if not PAD_ENABLED:
+                self.post(root, L("本机没装 remote-pad，遥控命令不可用。",
+                                  "remote-pad isn't installed on this host; "
+                                  "remote-control commands are unavailable."))
+            elif cmd == "pad":
+                self._pad(root)
+            elif cmd == "shot":
+                threading.Thread(target=self._shot, args=(root,),
+                                 daemon=True).start()
+            elif cmd == "type":
+                threading.Thread(target=self._inject_text,
+                                 args=(root, arg), daemon=True).start()
+            elif cmd == "key":
+                threading.Thread(target=self._inject_key,
+                                 args=(root, arg), daemon=True).start()
 
     def _queue_status(self, root):
         with self.lock:
@@ -3866,16 +3952,16 @@ class SessionBridge:
             total = len(self.dispatch_queue)
         s = self.sessions.get(root)
         if pos:
-            self.post(root, f"本任务在排队中（第 {pos}/{total} 位）；"
-                            "发 `!stop` 可取消排队。")
+            self.post(root, L(f"本任务在排队中（第 {pos}/{total} 位）；", f"this task is queued ({pos}/{total});") +
+                            L("发 `!stop` 可取消排队。", "`!stop` cancels the queue."))
             return
         if s and s.queued:
-            self.post(root, f"会话内还有 {s.queued} 条待处理消息。")
+            self.post(root, L(f"会话内还有 {s.queued} 条待处理消息。", f"{s.queued} more messages pending in this session."))
             return
         if total:
-            self.post(root, f"本线程没有排队任务；全局队列 {total} 条。")
+            self.post(root, L(f"本线程没有排队任务；全局队列 {total} 条。", f"no queued task on this thread; global queue has {total}."))
             return
-        self.post(root, "队列是空的。")
+        self.post(root, L("队列是空的。", "queue is empty."))
 
     def _reset(self, root):
         """Drop the session binding; the next in-thread reply starts a
@@ -3884,7 +3970,7 @@ class SessionBridge:
         self.limit_attempts.pop(root, None)
         s = self.sessions.get(root)
         if s and (s.running or s.queued):
-            self.post(root, "会话还在执行，先 `!stop` 再 `!reset`。")
+            self.post(root, L("会话还在执行，先 `!stop` 再 `!reset`。", "session still running — `!stop` first, then `!reset`."))
             return
         wd = self._workdir(root)
         if s:
@@ -3892,9 +3978,9 @@ class SessionBridge:
             with self.lock:
                 self.sessions.pop(root, None)
                 self.stop_flags.pop(root, None)
-            self._finish(root, s, "x", "🛑 会话被 !reset 重置")
+            self._finish(root, s, "x", L("🛑 会话被 !reset 重置", "🛑 Session reset by !reset"))
             if not dead:
-                self.post(root, "警告：进程退出未确认。")
+                self.post(root, L("警告：进程退出未确认。", "warning: process exit unconfirmed."))
         for name in GOAL_FILES:
             for p in (os.path.join(wd, name),
                       os.path.join(wd, name + ".attached")):
@@ -3905,9 +3991,9 @@ class SessionBridge:
         # The "reset" state is the in-thread restart marker:
         # handle_event turns the next reply into a fresh session even
         # across a bridge restart.
-        write_state(wd, "reset", "", "用户重置；下条回复开新会话")
-        self.post(root, "已重置：下次在本线程发言将开启全新会话"
-                        "（旧上下文不保留）。")
+        write_state(wd, "reset", "", L("用户重置；下条回复开新会话", "reset by user; next reply starts a new session"))
+        self.post(root, L("已重置：下次在本线程发言将开启全新会话", "reset: your next message in this thread starts a fresh session") +
+                        L("（旧上下文不保留）。", "(previous context is not kept)."))
 
     # ---- cross-device session interop -----------------------------
     # devin sessions are global (sessions.db): one id resumes anywhere —
@@ -3920,29 +4006,29 @@ class SessionBridge:
                 if getattr(s, "session_id", None)}
         rows = list_devin_sessions(15)
         if not rows:
-            self.post(root, "读不到本机 Devin 会话库（"
+            self.post(root, L("读不到本机 Devin 会话库（", "can't read the machine's Devin session store (") +
                             f"{DEVIN_DB}）。")
             return
         now = time.time()
-        lines = ["*本机 Devin 会话*（新→旧；`!adopt <id>` 接管到本线程）"]
+        lines = [L("*本机 Devin 会话*（新→旧；`!adopt <id>` 接管到本线程）", "*Devin sessions on this machine* (newest first; `!adopt <id>` to pull one into this thread)")]
         for r in rows:
             sid = r["id"]
             ago = int((now - r["activity"]) / 60)
             age = f"{ago}m" if ago < 60 else f"{ago // 60}h"
             title = _first_line(r["title"], 28)
             if sid in live:
-                mark = "▶ 桥接管中" + ("（本线程）"
+                mark = L("▶ 桥接管中", "▶ Bridged here") + (L("（本线程）", "(this thread)")
                                        if live[sid] == root else "")
             else:
                 if self._turn_live(sid):
-                    mark = "🔥 " + (self._last_action(sid) or "在跑")
+                    mark = "🔥 " + (self._last_action(sid) or L("在跑", "running"))
                 elif r["lock_pid"]:
-                    mark = "🔒 桌面/CLI 打开中"
+                    mark = L("🔒 桌面/CLI 打开中", "🔒 Open on Desktop/CLI")
                 else:
-                    mark = "💤 空闲"
-            lines.append(f"• `{sid}` {mark} {age}前 — {title}")
-        lines.append("桌面接管桥会话：`devin -r <id>` 或 Desktop 会话列表；"
-                     "桥会话同在此库中。")
+                    mark = L("💤 空闲", "💤 Idle")
+            lines.append(L(f"• `{sid}` {mark} {age}前 — {title}", f"• `{sid}` {mark} {age} ago — {title}"))
+        lines.append(L("桌面接管桥会话：`devin -r <id>` 或 Desktop 会话列表；", "Desktop takes over a bridged session via `devin -r <id>` or the session list;") +
+                     L("桥会话同在此库中。", "bridged sessions live in the same store."))
         self.post(root, "\n".join(lines))
 
     def _adopt(self, root, arg):
@@ -3959,25 +4045,25 @@ class SessionBridge:
                     if r["id"] not in bound]
             cand = next((r for r in rows if not r["lock_pid"]), None)
             if not cand:
-                hint = (f"最近的会话都被占着（🔒）：点名接管 "
+                hint = (L(f"最近的会话都被占着（🔒）：点名接管 ", f"recent sessions are all held (🔒): adopt by name ") +
                         f"`!adopt {rows[0]['id']}`" if rows else
-                        "没有可接管的会话")
-                self.post(root, hint + "（`!sessions` 看全表）。")
+                        L("没有可接管的会话", "no adoptable sessions"))
+                self.post(root, hint + L("（`!sessions` 看全表）。", "(`!sessions` for the full list)."))
                 return
             row = cand
             sid = row["id"]
         else:
             row = devin_session(sid)
             if not row:
-                self.post(root, f"找不到会话 `{sid}`"
-                                "（`!sessions` 看可用 id）。")
+                self.post(root, L(f"找不到会话 `{sid}`", f"can't find session `{sid}`") +
+                                L("（`!sessions` 看可用 id）。", "(`!sessions` for available ids)."))
                 return
         s = self.sessions.get(root)
         if s and (s.running or s.queued):
-            self.post(root, "本线程会话还在执行，先 `!stop`。")
+            self.post(root, L("本线程会话还在执行，先 `!stop`。", "this thread's session is still running — `!stop` first."))
             return
         if s and s.session_id == sid:
-            self.post(root, f"`{sid}` 已经是本线程的会话。")
+            self.post(root, L(f"`{sid}` 已经是本线程的会话。", f"`{sid}` is already this thread's session."))
             return
         if s:
             s.terminate()
@@ -4001,7 +4087,7 @@ class SessionBridge:
                 os.unlink(_state_path(wd))
             except OSError:
                 pass
-        ack_ts = self.post(root, f"正在接管会话 `{sid}`…")
+        ack_ts = self.post(root, L(f"正在接管会话 `{sid}`…", f"adopting session `{sid}`…"))
         # A live lock means another devin frontend (Desktop tab, `devin
         # -r`) has it open — acp refuses session/load outright. Taking
         # over = taking the lock: removing the file lets our acp claim
@@ -4034,11 +4120,11 @@ class SessionBridge:
             err = getattr(e, "args", [None])[0] or {}
             hint = _stderr_hint(wd)
             if "already open" in str(err):
-                self.post(root, f"⛔ `{sid}` 还被桌面/CLI 抓着，抢锁失败。"
-                                "先去那边关掉这个会话（Desktop 关闭 tab，"
-                                "或退出 `devin -r`），再 `!adopt`。")
+                self.post(root, L(f"⛔ `{sid}` 还被桌面/CLI 抓着，抢锁失败。", f"⛔ `{sid}` is still held by Desktop/CLI; couldn't take the lock.") +
+                                L("先去那边关掉这个会话（Desktop 关闭 tab，", "close this session on that side first (close the Desktop tab,") +
+                                L("或退出 `devin -r`），再 `!adopt`。", "or quit `devin -r`), then `!adopt`."))
             else:
-                self.post(root, f"接管失败: {type(e).__name__}: {e}"
+                self.post(root, L(f"接管失败: {type(e).__name__}: {e}", f"adopt failed: {type(e).__name__}: {e}")
                                 + (f"（acp: {hint}）" if hint else ""))
             with self.lock:
                 self.starting.discard(root)
@@ -4051,16 +4137,16 @@ class SessionBridge:
                          daemon=True).start()
         title = _first_line(row["title"])
         if gone:
-            self.post(root, f"⚠️ 原目录 `{acp_cwd}` 已不存在，"
-                            "会话锚在本线程目录。")
+            self.post(root, L(f"⚠️ 原目录 `{acp_cwd}` 已不存在，", f"⚠️ original dir `{acp_cwd}` no longer exists;") +
+                            L("会话锚在本线程目录。", "session anchored to this thread's directory."))
         if s.resumed:
-            stole = (f"（从桌面/CLI 手里抢过来的，那边还开着，"
-                     "两边别同时发）" if locked else "")
-            outcome = (f"✅ 已接管 `{sid}`（{title}）{stole}——"
-                       f"完整上下文在。项目目录 `{s.acp_cwd}`；"
-                       "直接回复继续，`!release` 交还。")
+            stole = (L(f"（从桌面/CLI 手里抢过来的，那边还开着，", f"(taken over from Desktop/CLI, which is still open —") +
+                     L("两边别同时发）", "don't drive both sides at once)") if locked else "")
+            outcome = (L(f"✅ 已接管 `{sid}`（{title}）{stole}——", f"✅ adopted `{sid}` ({title}){stole} —") +
+                       L(f"完整上下文在。项目目录 `{s.acp_cwd}`；", f"full context intact. Project dir `{s.acp_cwd}`;") +
+                       L("直接回复继续，`!release` 交还。", "reply to continue, `!release` to hand it back."))
         else:
-            outcome = (f"⚠️ `{sid}` 加载失败（可能已被清理），已在 "
+            outcome = (L(f"⚠️ `{sid}` 加载失败（可能已被清理），已在 ", f"⚠️ `{sid}` failed to load (maybe cleaned); started a new session in ") +
                        f"`{s.acp_cwd}` 开新会话顶替。")
         if not (ack_ts and self._upd(ack_ts, outcome)):
             self.post(root, outcome)
@@ -4074,11 +4160,11 @@ class SessionBridge:
             s = self.sessions.get(root)
             sid = getattr(s, "session_id", None) if s else None
             if not sid:
-                self.post(root, "`!peek <会话id>` 看它在干嘛（不动锁）;"
-                                "`!sessions` 拿全表。")
+                self.post(root, L("`!peek <会话id>` 看它在干嘛（不动锁）;", "`!peek <session-id>` to see what it's doing (no lock);") +
+                                L("`!sessions` 拿全表。", "`!sessions` for the full list."))
                 return
         if not devin_session(sid):
-            self.post(root, f"找不到会话 `{sid}`（`!sessions` 看可用 id）。")
+            self.post(root, L(f"找不到会话 `{sid}`（`!sessions` 看可用 id）。", f"can't find session `{sid}` (`!sessions` for available ids)."))
             return
         self.post(root, self._peek_text(sid))
 
@@ -4093,19 +4179,19 @@ class SessionBridge:
             st = read_state(self._workdir(root))
             sid = (st or {}).get("session_id")
         if not sid:
-            self.post(root, "本线程还没有会话可移交。")
+            self.post(root, L("本线程还没有会话可移交。", "no session on this thread to hand off."))
             return
         row = devin_session(sid) or {}
         title = _first_line(row.get("title"))
-        lines = [f"会话 `{sid}`"
+        lines = [L(f"会话 `{sid}`", f"session `{sid}`")
                  + (f"（{title}）" if title else "")]
-        lines.append("它在本机全局会话库，Desktop 会话列表里能直接看到。")
+        lines.append(L("它在本机全局会话库，Desktop 会话列表里能直接看到。", "It's in the machine-wide session store — visible in Desktop's session list."))
         if root in self.sessions:
-            lines.append("桥的 acp 正持有它的锁——先发 `!release` 松手，"
-                         f"再 `devin -r {sid}` 或 Desktop 里打开。")
+            lines.append(L("桥的 acp 正持有它的锁——先发 `!release` 松手，", "the bridge's acp holds its lock — `!release` first,") +
+                         L(f"再 `devin -r {sid}` 或 Desktop 里打开。", f"then `devin -r {sid}` or open it in Desktop."))
         else:
-            lines.append(f"桌面 `devin -r {sid}` 直接接管；"
-                         "本线程 `!adopt` 也能接回。")
+            lines.append(L(f"桌面 `devin -r {sid}` 直接接管；", f"`devin -r {sid}` on desktop takes it over;") +
+                         L("本线程 `!adopt` 也能接回。", "`!adopt` in this thread also brings it back."))
         self.post(root, "\n".join(lines))
 
     def _release(self, root):
@@ -4115,22 +4201,22 @@ class SessionBridge:
         s = self.sessions.get(root)
         sid = getattr(s, "session_id", None) if s else None
         if s and (s.running or s.queued):
-            self.post(root, "会话还在执行，先 `!stop` 再 `!release`。")
+            self.post(root, L("会话还在执行，先 `!stop` 再 `!release`。", "session still running — `!stop` first, then `!release`."))
             return
         if not s:
-            self.post(root, "本线程没有桥接会话可释放。")
+            self.post(root, L("本线程没有桥接会话可释放。", "no bridged session on this thread to release."))
             return
         s.terminate()
         with self.lock:
             self.sessions.pop(root, None)
             self.stop_flags.pop(root, None)
         write_state(self._workdir(root), "released", "",
-                    f"会话 {sid or '?'} 已释放，可在桌面接管",
+                    L(f"会话 {sid or '?'} 已释放，可在桌面接管", f"session {sid or '?'} released; can be adopted on desktop"),
                     extra={"session_id": sid})
         self._react_state(root, "hand")
-        self.post(root, f"已释放 `{sid}`——上下文保留在本机会话库。"
-                        f"桌面 `devin -r {sid}` 接管；本线程再发消息"
-                        "或 `!adopt` 也能接回来。")
+        self.post(root, L(f"已释放 `{sid}`——上下文保留在本机会话库。", f"released `{sid}` — context kept in the machine session store.") +
+                        L(f"桌面 `devin -r {sid}` 接管；本线程再发消息", f"`devin -r {sid}` on desktop takes over; message this thread again") +
+                        L("或 `!adopt` 也能接回来。", "or `!adopt` to bring it back."))
         self._board_touch()
 
     # Phone-side remote control lives in ~/remote-pad (ydotoold +
@@ -4161,26 +4247,27 @@ class SessionBridge:
         except OSError:
             ok = False
         if not ok:
-            self.post(root, "remote-pad 没就绪（缺 token）。")
+            self.post(root, L("remote-pad 没就绪（缺 token）。", "remote-pad isn't ready (missing token)."))
             return
         urls = " ｜ ".join(f"http://{ip}:8877/t/{tok}/"
                           for ip in self._pad_ips())
         self.post(root,
-                  "*手机遥控这台电脑*\n"
-                  f"• Web 控制台（打字/触控板/快捷键）：{urls}\n"
-                  "• 完整桌面 RDP：`3389` 已开（Windows App / Jump 等"
-                  "客户端，账号密码=远程桌面设置的那组）\n"
-                  "• KDE Connect（手机键盘/触控板/剪贴板，推荐）：装 KDE "
-                  "Connect app → 配对界面右上角 ⋯ → Add devices by IP → "
-                  "填 `100.69.104.50`；电脑上跑 `~/remote-pad/kdec.sh list`"
-                  " + `kdec.sh pair <id>` 确认配对\n"
-                  "• `!type 文字` `!key ctrl+alt+t` `!shot` 可在本线程"
-                  "直接注入\n"
-                  "手机要开着 Tailscale，或连家里同一个 Wi-Fi。")
+                  L("*手机遥控这台电脑*\\n", "*Remote-control this computer from your phone*\n") +
+                  L(f"• Web 控制台（打字/触控板/快捷键）：{urls}\\n", f"• Web console (typing/trackpad/shortcuts): {urls}\n") +
+                  L("• 完整桌面 RDP：`3389` 已开（Windows App / Jump 等", "• Full-desktop RDP: `3389` is open (Windows App / Jump etc") +
+                  L("客户端，账号密码=远程桌面设置的那组）\\n", "client; credentials are the remote-desktop pair)\n") +
+                  L("• KDE Connect（手机键盘/触控板/剪贴板，推荐）：装 KDE ", "• KDE Connect (phone keyboard/trackpad/clipboard, recommended): install the KDE ") +
+                  L("Connect app → 配对界面右上角 ⋯ → Add devices by IP → ", "Connect app → pairing screen top-right ⋯ → Add devices by IP → ") +
+                  L(f"填 `{self._pad_ips()[0]}`；电脑上跑 `{PAD_DIR}/kdec.sh list`",
+                    f"enter `{self._pad_ips()[0]}`; on the computer run `{PAD_DIR}/kdec.sh list`") +
+                  L(" + `kdec.sh pair <id>` 确认配对\\n", " + `kdec.sh pair <id>` to confirm pairing\n") +
+                  L("• `!type 文字` `!key ctrl+alt+t` `!shot` 可在本线程", "• `!type <text>` `!key ctrl+alt+t` `!shot` work in this thread") +
+                  L("直接注入\\n", "to inject directly\n") +
+                  L("手机要开着 Tailscale，或连家里同一个 Wi-Fi。", "phone needs Tailscale on, or the same home Wi-Fi."))
 
     def _shot(self, root):
         if not os.path.exists(SCREENGRAB):
-            self.post(root, "screengrab 还没装。")
+            self.post(root, L("screengrab 还没装。", "screengrab isn't installed yet."))
             return
         try:
             r = subprocess.run([sys.executable, SCREENGRAB, "20"],
@@ -4201,14 +4288,14 @@ class SessionBridge:
                 self._log_err("shot upload", e)
         why = ((r.stderr if r else b"") or b"")
         why = why.decode("utf-8", "replace")
-        self.post(root, "📷 暂时截不到桌面：" + _one_line(why, 110)
-                        + "（GNOME 只放行「本机点过共享」的抓屏；"
-                          "看实时桌面走 RDP 客户端）")
+        self.post(root, L("📷 暂时截不到桌面：", "📷 Can't capture the desktop right now:") + _one_line(why, 110)
+                        + L("（GNOME 只放行「本机点过共享」的抓屏；", "(GNOME only allows screen capture after a local share click;") +
+                          L("看实时桌面走 RDP 客户端）", "use an RDP client for the live desktop)"))
 
     def _inject_text(self, root, arg):
         if not arg:
-            self.post(root, "`!type <文字>` 打进电脑当前焦点窗口"
-                            "（中文自动转剪贴板粘贴）。")
+            self.post(root, L("`!type <文字>` 打进电脑当前焦点窗口", "`!type <text>` types into the computer's focused window") +
+                            L("（中文自动转剪贴板粘贴）。", "(non-ASCII text goes through clipboard paste)."))
             return
         try:
             r = subprocess.run([sys.executable, INPUTCTL, "type",
@@ -4219,13 +4306,13 @@ class SessionBridge:
         except (OSError, subprocess.SubprocessError) as e:
             out = f"{type(e).__name__}: {e}"
         self._react(root, "keyboard")
-        self.post(root, f"⌨️ 已发送 {len(arg)} 字到电脑"
+        self.post(root, L(f"⌨️ 已发送 {len(arg)} 字到电脑", f"⌨️ sent {len(arg)} chars to the computer")
                         + ("" if out in ("", "ok") else f"：{out[:80]}"))
 
     def _inject_key(self, root, arg):
         if not arg:
-            self.post(root, "`!key <组合>` 给电脑按键，"
-                            "如 `!key ctrl+alt+t`、`!key enter`。")
+            self.post(root, L("`!key <组合>` 给电脑按键，", "`!key <combo>` presses keys on the computer,") +
+                            L("如 `!key ctrl+alt+t`、`!key enter`。", "e.g. `!key ctrl+alt+t`, `!key enter`."))
             return
         try:
             r = subprocess.run([sys.executable, INPUTCTL, "key", arg],
@@ -4318,7 +4405,7 @@ class SessionBridge:
     @staticmethod
     def _node_snippet(m):
         """One transcript node → a phone-length 'what happened'
-        line, e.g. '跑 exec: docker ps' or '回: 已接管'."""
+        line, e.g. L("跑 exec: docker ps", "ran exec: docker ps") or L("回: 已接管", "reply: adopted")."""
         role = m.get("role")
         content = (m.get("content") or "").strip()
         if role == "assistant":
@@ -4332,20 +4419,20 @@ class SessionBridge:
                        or args.get("path") or args.get("query")
                        or next(iter(args.values()), ""))
                 extra = f" +{len(tcs) - 1}" if len(tcs) > 1 else ""
-                return f"跑 {tc.get('name', '?')}: " \
+                return L(f"跑 {tc.get('name', '?')}: ", f"ran {tc.get('name', '?')}: ") + \
                        f"{_one_line(arg, 50)}{extra}"
             if content:
-                return "回: " + _one_line(content, 56)
-            return "思考中…"
+                return L("回: ", "reply: ") + _one_line(content, 56)
+            return L("思考中…", "thinking…")
         if role == "tool":
             # 'Output from command in shell xxx:' is transport noise —
             # the useful part is the output itself.
             body = re.sub(r"^Output from command in shell \S+:\s*",
                           "", content)
             body = re.sub(r"Exit code: \d+", "", body)
-            return "结果: " + _one_line(body or content, 56)
+            return L("结果: ", "result: ") + _one_line(body or content, 56)
         if role == "user":
-            return "收到: " + _one_line(content, 56)
+            return L("收到: ", "got: ") + _one_line(content, 56)
         return _one_line(content, 56)
 
     def _last_action(self, sid):
@@ -4380,15 +4467,15 @@ class SessionBridge:
         row = devin_session(sid) or {}
         title = _first_line(row.get("title"), 40) or sid
         rows = self._tail_nodes(sid, 6)
-        head = f"👀 *{title}* `{sid}` — 最近动态"
+        head = L(f"👀 *{title}* `{sid}` — 最近动态", f"👀 *{title}* `{sid}` — recent activity")
         if not rows:
-            return head + "：暂无记录。"
+            return head + L("：暂无记录。", ": no records.")
         now = time.time()
         lines = [head]
         for m, ts in rows:
             ago = max(0, int(now - (ts or now)))
-            rel = ("刚" if ago < 60 else f"{ago // 60}m前"
-                   if ago < 3600 else f"{ago // 3600}h前")
+            rel = (L("刚", "just now") if ago < 60 else L(f"{ago // 60}m前", f"{ago // 60}m ago")
+                   if ago < 3600 else L(f"{ago // 3600}h前", f"{ago // 3600}h ago"))
             lines.append(f"· _{rel}_ {self._node_snippet(m)}")
         return "\n".join(lines)
 
@@ -4420,7 +4507,7 @@ class SessionBridge:
                 wait = ""
                 if e and e.get("resume_at"):
                     m = max(0, int((e["resume_at"] - now) / 60))
-                    wait = f" ~{m}m后"
+                    wait = L(f" ~{m}m后", f" ~{m}m")
                 mark, rank = f"⏸{wait}", 1
             else:
                 mark, rank = "💤", 2
@@ -4434,7 +4521,7 @@ class SessionBridge:
             fresh = self._session_fresh(sid)
             basis = fresh or r["activity"]
             ago = int((now - basis) / 60)
-            age = ("刚" if ago < 1 else f"{ago}m" if ago < 60
+            age = (L("刚", "just now") if ago < 1 else f"{ago}m" if ago < 60
                    else f"{ago // 60}h" if ago < 1440
                    else f"{ago // 1440}d")
             title = _first_line(r["title"], 42)
@@ -4442,7 +4529,7 @@ class SessionBridge:
             if key in parked:
                 e = parked[key]
                 m = max(0, int(((e.get("resume_at") or now) - now) / 60))
-                cool.append((basis, sid, title, f"⏸ ~{m}m后", age))
+                cool.append((basis, sid, title, L(f"⏸ ~{m}m后", f"⏸ ~{m}m"), age))
             elif self._turn_live(sid):
                 hot.append((basis, sid, title, "🔥",
                             self._last_action(sid)))
@@ -4518,16 +4605,16 @@ class SessionBridge:
             bps /= 1024
 
     def _vitals_line(self, v):
-        """🖥 CPU 34% · 内存 62% · ⚠️磁盘 91% · ⬇0.4M ⬆0.1M"""
+        """🖥 CPU 34% · mem 62% · ⚠️disk 91% · ⬇0.4M ⬆0.1M"""
         def tag(key, txt, warn):
             return f"⚠️{txt}" if v.get(key, 0) >= warn else txt
         parts = []
         if "cpu" in v:
             parts.append(tag("cpu", f"CPU {v['cpu']}%", VITAL_CPU))
         if "mem" in v:
-            parts.append(tag("mem", f"内存 {v['mem']}%", VITAL_MEM))
+            parts.append(tag("mem", L(f"内存 {v['mem']}%", f"mem {v['mem']}%"), VITAL_MEM))
         if "disk" in v:
-            parts.append(tag("disk", f"磁盘 {v['disk']}%", VITAL_DISK))
+            parts.append(tag("disk", L(f"磁盘 {v['disk']}%", f"disk {v['disk']}%"), VITAL_DISK))
         if "rx" in v:
             parts.append(f"⬇{self._fmt_rate(v['rx'])}/s "
                          f"⬆{self._fmt_rate(v['tx'])}/s")
@@ -4536,41 +4623,41 @@ class SessionBridge:
     def _board_render(self):
         vitals = self._sys_vitals()
         bound, hot, cool, idle = self._board_rows()
-        L = ["📋 *会话看板* · 更新于 " + time.strftime("%m-%d %H:%M")]
+        lines = [L("📋 *会话看板* · 更新于 ", "📋 *Session Board* · updated ") + time.strftime("%m-%d %H:%M")]
         if bound:
-            L.append("*💬 桥接管中*")
+            lines.append(L("*💬 桥接管中*", "*💬 Bridged sessions*"))
             for _, _, sid, title, mark, ts in bound[:6]:
-                L.append(f"• *{title}*\n  `{sid}` {mark} — "
-                         f"<{self._board_permalink(ts)}|进去聊>")
+                lines.append(f"• *{title}*\n  `{sid}` {mark} — " +
+                         L(f"<{self._board_permalink(ts)}|进去聊>", f"<{self._board_permalink(ts)}|Open>"))
         if hot:
-            L.append(f"*🔥 在跑 ({len(hot)})*")
+            lines.append(L(f"*🔥 在跑 ({len(hot)})*", f"*🔥 Running ({len(hot)})*"))
             for _, sid, title, mark, action in hot[:BOARD_MAX_ROWS]:
-                L.append(f"• *{title}*\n  `{sid}` {mark} "
-                         f"{action or '进行中'}")
+                lines.append(f"• *{title}*\n  `{sid}` {mark} " +
+                         L(f"{action or '进行中'}", f"{action or 'working'}"))
             if len(hot) > BOARD_MAX_ROWS:
-                L.append(f"  …另 {len(hot) - BOARD_MAX_ROWS}"
-                         " 个在跑（底部下拉可接管）")
+                lines.append(L(f"  …另 {len(hot) - BOARD_MAX_ROWS}", f"  …{len(hot) - BOARD_MAX_ROWS} more") +
+                         L(" 个在跑（底部下拉可接管）", " more running (adopt from the menu below)"))
         if cool:
-            L.append("*⏸ 限额冷却*")
+            lines.append(L("*⏸ 限额冷却*", "*⏸ Rate-limit cooldown*"))
             for _, sid, title, mark, age in cool[:4]:
-                L.append(f"• *{title}*\n  `{sid}` {mark}")
+                lines.append(f"• *{title}*\n  `{sid}` {mark}")
         opened = [i for i in idle if i[3] == "📂"]
         asleep = [i for i in idle if i[3] == "💤"]
         if opened:
             names = " · ".join(f"`{i[1]}`" for i in opened[:4])
             more = f" +{len(opened) - 4}" if len(opened) > 4 else ""
-            L.append(f"📂 桌面开着没跑({len(opened)}):{names}{more}")
+            lines.append(L(f"📂 桌面开着没跑({len(opened)}):{names}{more}", f"📂 open-not-running({len(opened)}):{names}{more}"))
         if asleep:
             names = " · ".join(f"`{i[1]}`" for i in asleep[:4])
             more = f" +{len(asleep) - 4}" if len(asleep) > 4 else ""
-            L.append(f"💤 空闲({len(asleep)}):{names}{more}")
+            lines.append(L(f"💤 空闲({len(asleep)}):{names}{more}", f"💤 idle({len(asleep)}):{names}{more}"))
         if not bound and not hot and not cool and not idle:
-            L.append("暂无会话。")
+            lines.append(L("暂无会话。", "no sessions yet."))
         vline = self._vitals_line(vitals)
         if vline:
-            L.append(vline)
-        L.append("_🔥干活中 ⏸限额冷却 📂被打开没跑 · 下拉接管任意会话_")
-        text = "\n".join(L)
+            lines.append(vline)
+        lines.append(L("_🔥干活中 ⏸限额冷却 📂被打开没跑 · 下拉接管任意会话_", "_🔥 running ⏸ cooling down 📂 open-not-running · adopt any session below_"))
+        text = "\n".join(lines)
 
         def sec(txt, btn=None):
             b = {"type": "section",
@@ -4584,27 +4671,27 @@ class SessionBridge:
             over into a fresh thread."""
             return {"type": "actions", "elements": [
                 {"type": "button", "action_id": "board_peek",
-                 "text": {"type": "plain_text", "text": "看看"},
+                 "text": {"type": "plain_text", "text": L("看看", "Peek")},
                  "value": sid},
                 {"type": "button", "action_id": "board_adopt",
-                 "text": {"type": "plain_text", "text": "接管"},
+                 "text": {"type": "plain_text", "text": L("接管", "Adopt")},
                  "value": sid}]}
 
-        blocks = [sec(L[0])]
+        blocks = [sec(lines[0])]
         for _, _, sid, title, mark, ts in bound[:6]:
             blocks.append(sec(
                 f"*{title}*\n`{sid}` {mark}",
                 {"type": "button",
-                 "text": {"type": "plain_text", "text": "进去聊"},
+                 "text": {"type": "plain_text", "text": L("进去聊", "Open")},
                  "url": self._board_permalink(ts)}))
         for _, sid, title, mark, action in hot[:BOARD_MAX_ROWS]:
-            blocks.append(sec(f"🔥 *{title}*\n`{sid}` · "
-                              f"_{action or '进行中'}_"))
+            blocks.append(sec(f"🔥 *{title}*\n`{sid}` · " +
+                              L(f"_{action or '进行中'}_", f"_{action or 'working'}_")))
             blocks.append(row_actions(sid))
         for _, sid, title, mark, age in cool[:4]:
             blocks.append(sec(f"*{title}*\n`{sid}` {mark}"))
             blocks.append(row_actions(sid))
-        for line in L[1:]:
+        for line in lines[1:]:
             if line.startswith(("📂", "💤", "🖥")):
                 blocks.append({"type": "context", "elements": [
                     {"type": "mrkdwn", "text": line}]})
@@ -4615,7 +4702,7 @@ class SessionBridge:
             blocks.append({"type": "actions", "elements": [
                 {"type": "static_select", "action_id": "board_pick",
                  "placeholder": {"type": "plain_text",
-                                 "text": "接管其他会话…"},
+                                 "text": L("接管其他会话…", "Adopt another session…")},
                  "options": [
                      {"text": {"type": "plain_text",
                                "text": f"{i[3]} {i[2][:44]} · {i[1]}"},
@@ -4625,7 +4712,7 @@ class SessionBridge:
         else:
             blocks.append({"type": "actions", "elements": [
                 {"type": "button", "action_id": "board_reload",
-                 "text": {"type": "plain_text", "text": "🔄 刷新"}}]})
+                 "text": {"type": "plain_text", "text": L("🔄 刷新", "🔄 Refresh")}}]})
         return text, blocks
 
     def _board_touch(self):
@@ -4669,23 +4756,23 @@ class SessionBridge:
             self._autoclean(self._vitals)
             self._audit_check()
         if reply_to:
-            self.post(reply_to, "看板已刷新（频道置顶那条 📋）。")
+            self.post(reply_to, L("看板已刷新（频道置顶那条 📋）。", "board refreshed (the pinned 📋 one in the channel)."))
 
     def _board_adopt(self, sid):
         """Board button/dropdown adopt: spawn a fresh anchor so the
         takeover lands in its own thread — one tap, zero typing."""
         row = devin_session(sid)
         if not row:
-            self.post(None, f"`{sid}` 已不在会话库（可能刚被清理）。")
+            self.post(None, L(f"`{sid}` 已不在会话库（可能刚被清理）。", f"`{sid}` is gone from the session store (maybe just cleaned)."))
             return
         bound = {ts for ts, s in self.sessions.items()
                  if getattr(s, "session_id", None) == sid}
         if bound:
             self.post(next(iter(bound)),
-                      "这个会话已绑在本线程——直接回复继续。")
+                      L("这个会话已绑在本线程——直接回复继续。", "this session is bound to this thread — just reply to continue."))
             return
         anchor = self.post(
-            None, f"📥 接管 `{sid}` —— {_first_line(row.get('title'), 40)}")
+            None, L(f"📥 接管 `{sid}` —— {_first_line(row.get('title'), 40)}", f"📥 Adopt `{sid}` — {_first_line(row.get('title'), 40)}"))
         if anchor:
             self._adopt(anchor, sid)
 
@@ -4702,8 +4789,8 @@ class SessionBridge:
                 return
             except Exception as e:
                 self._log_err("board ephemeral", e)
-        self.post(root, "看板在频道置顶那条 📋——和机器人的私聊里也"
-                        "有一份实时同步的，手机上最顺手。")
+        self.post(root, L("看板在频道置顶那条 📋——和机器人的私聊里也", "the board is the pinned 📋 message in the channel —") +
+                        L("有一份实时同步的，手机上最顺手。", "there's a synced copy in the bot DM — handiest on mobile."))
 
     def _board_bookmark(self, ts):
         """Keep a channel header bookmark aimed at the pinned board —
@@ -4716,12 +4803,12 @@ class SessionBridge:
         try:
             link = self.permalink(ts)
             hit = next((b for b in self.bookmarks()
-                        if "看板" in (b.get("title") or "")), None)
+                        if L("看板", "board") in (b.get("title") or "")), None)
             if hit and hit.get("link") != link \
                     and self.bookmark_edit:
                 self.bookmark_edit(hit["id"], link)
             elif not hit:
-                self.bookmark_add("📋 会话看板", link)
+                self.bookmark_add(L("📋 会话看板", "📋 Session Board"), link)
             self._board_bookmarked = ts
         except Exception as e:
             self._log_err("board bookmark", e)
@@ -4788,14 +4875,14 @@ class SessionBridge:
             self._spawn_cleanup(key, v)
 
     def _spawn_cleanup(self, metric, v):
-        label = {"disk": "磁盘", "mem": "内存", "cpu": "CPU"}[metric]
+        label = {"disk": L("磁盘", "disk"), "mem": L("内存", "memory"), "cpu": "CPU"}[metric]
         val = v.get(metric)
         if self._auto_live() >= MAX_AUTO:
             return
         try:
             anchor = self.post(
-                None, f"🧹 *自动清理*：{label} {val}% 超阈值，"
-                      "已派会话诊断并安全释放。")
+                None, L(f"🧹 *自动清理*：{label} {val}% 超阈值，", f"🧹 *Auto-clean*: {label} {val}% over threshold,") +
+                      L("已派会话诊断并安全释放。", "spawned a session to diagnose and safely free it."))
         except Exception as e:
             self._log_err("cleanup anchor", e)
             return
@@ -4826,25 +4913,25 @@ class SessionBridge:
     def _audit_spawn(self):
         up = int(time.time() - self._started)
         errs = ", ".join(f"{k}×{n}" for k, n in
-                         self._err_stats.most_common(8)) or "无"
+                         self._err_stats.most_common(8)) or L("无", "none")
         try:
             parked = len(self.governor.snapshot() or {})
         except Exception:
             parked = 0
         v = self._vitals
-        digest = (f"桥已运行 {up//3600}h{(up%3600)//60}m · "
-                  f"接管会话 {len(self.sessions)} · "
-                  f"排队 {len(self.dispatch_queue)} · "
-                  f"崩溃重试中 {len(self.crash_retries)} · "
-                  f"限额挂起 {parked} · "
-                  f"DM 看板 {len(self._dm_boards)} 份\n"
-                  f"系统体征：CPU {v.get('cpu','?')}% · "
-                  f"内存 {v.get('mem','?')}% · 磁盘 {v.get('disk','?')}%\n"
-                  f"错误统计（本次运行）：{errs}")
+        digest = (L(f"桥已运行 {up//3600}h{(up%3600)//60}m · ", f"bridge up {up//3600}h{(up%3600)//60}m · ") +
+                  L(f"接管会话 {len(self.sessions)} · ", f"sessions {len(self.sessions)} · ") +
+                  L(f"排队 {len(self.dispatch_queue)} · ", f"queued {len(self.dispatch_queue)} · ") +
+                  L(f"崩溃重试中 {len(self.crash_retries)} · ", f"crash-retrying {len(self.crash_retries)} · ") +
+                  L(f"限额挂起 {parked} · ", f"parked {parked} · ") +
+                  L(f"DM 看板 {len(self._dm_boards)} 份\\n", f"DM boards {len(self._dm_boards)}\n") +
+                  L(f"系统体征：CPU {v.get('cpu','?')}% · ", f"host vitals: CPU {v.get('cpu','?')}% · ") +
+                  L(f"内存 {v.get('mem','?')}% · 磁盘 {v.get('disk','?')}%\\n", f"mem {v.get('mem','?')}% · disk {v.get('disk','?')}%\n") +
+                  L(f"错误统计（本次运行）：{errs}", f"error counts (this run): {errs}"))
         try:
             anchor = self.post(
-                None, "🩺 *桥定期体检*：正在检查日志/状态/Slack 面，"
-                      "报告稍后发到本线程。")
+                None, L("🩺 *桥定期体检*：正在检查日志/状态/Slack 面，", "🩺 *Bridge self-audit*: checking logs/state/Slack surfaces,") +
+                      L("报告稍后发到本线程。", "report follows in this thread."))
         except Exception as e:
             self._log_err("audit anchor", e)
             return
@@ -4869,7 +4956,7 @@ class SessionBridge:
             d = self._board_load()
             cid = d.get("canvas")
             if not cid and self.canvas_create:
-                cid = self.canvas_create("📋 会话看板", md)
+                cid = self.canvas_create(L("📋 会话看板", "📋 Session Board"), md)
                 if cid:
                     d["canvas"] = cid
                     self._board_write(d)
@@ -4957,13 +5044,13 @@ class SessionBridge:
             except AcpExited:
                 res = "dead"
         if res is None:
-            self.post(root, "该审批请求已处理或已失效。")
+            self.post(root, L("该审批请求已处理或已失效。", "this approval request was handled or expired."))
             return
         if res == "dead":
-            self.post(root, "审批应答发送失败：会话进程已退出。")
+            self.post(root, L("审批应答发送失败：会话进程已退出。", "approval reply failed: session process exited."))
             return
         if res == "bad_option":
-            self.post(root, "按钮与请求不匹配（可能已过期）。")
+            self.post(root, L("按钮与请求不匹配（可能已过期）。", "button doesn't match the request (probably expired)."))
             return
         opt, summary, perm_ts = res
         kind = str(opt.get("kind", ""))
@@ -4971,8 +5058,8 @@ class SessionBridge:
         name = opt.get("name") or kind or oid
         mark = "✅" if allow else "❌"
         self._perm_update(perm_ts or msg_ts,
-                          f"{mark} {summary}\n已由 "
-                          f"{who or '人工'} 选择：{name}")
+                          L(f"{mark} {summary}\\n已由 ", f"{mark} {summary}\nby ") +
+                          L(f"{who or '人工'} 选择：{name}", f"{who or 'human'} chose: {name}"))
 
     def _perm_update(self, msg_ts, text):
         if msg_ts:
@@ -4983,20 +5070,20 @@ class SessionBridge:
         forwarded to the session with the rejection, so the agent can
         adjust instead of hitting a silent wall."""
         if not self.open_modal:
-            self.post(root, "请直接回复一句拒绝理由，会连同拒绝转达。")
+            self.post(root, L("请直接回复一句拒绝理由，会连同拒绝转达。", "reply with a one-line deny reason — it's forwarded with the rejection."))
             return
         view = {
             "type": "modal",
             "callback_id": "perm_reason",
             "private_metadata": json.dumps(
                 {"root": root, "rid": rid, "mts": msg_ts}),
-            "title": {"type": "plain_text", "text": "拒绝并说明"},
-            "submit": {"type": "plain_text", "text": "发送"},
-            "close": {"type": "plain_text", "text": "取消"},
+            "title": {"type": "plain_text", "text": L("拒绝并说明", "Deny with reason")},
+            "submit": {"type": "plain_text", "text": L("发送", "Send")},
+            "close": {"type": "plain_text", "text": L("取消", "cancel")},
             "blocks": [{
                 "type": "input", "block_id": "reason", "optional": True,
                 "label": {"type": "plain_text",
-                          "text": "拒绝理由（连同拒绝发给会话）"},
+                          "text": L("拒绝理由（连同拒绝发给会话）", "deny reason (sent to the session with the rejection)")},
                 "element": {"type": "plain_text_input",
                             "action_id": "text", "multiline": True}}],
         }
@@ -5004,7 +5091,7 @@ class SessionBridge:
             self.open_modal(payload.get("trigger_id"), view)
         except Exception as e:
             self._log_err("open modal", e)
-            self.post(root, "弹窗失败：请直接回复一句拒绝理由。")
+            self.post(root, L("弹窗失败：请直接回复一句拒绝理由。", "dialog failed: please reply with a deny reason."))
 
     def _perm_reason_submit(self, payload):
         view = payload.get("view") or {}
@@ -5022,7 +5109,7 @@ class SessionBridge:
         if not entry:
             # The request already expired (timeout/turn end) before the
             # human submitted — don't claim a decision was delivered.
-            self._perm_update(msg_ts, "该审批请求已处理或已失效。")
+            self._perm_update(msg_ts, L("该审批请求已处理或已失效。", "this approval request was handled or expired."))
             return
         pick = next((o for o in entry.get("all_options") or []
                      if not str(o.get("kind", "")).startswith("allow")),
@@ -5032,16 +5119,16 @@ class SessionBridge:
                 s.user_decide_option(rid, pick.get("optionId"), who)
             except AcpExited:
                 pass
-        summary = entry.get("summary") or "审批请求"
-        note = f"（理由：{reason.strip()}）" if reason.strip() else ""
+        summary = entry.get("summary") or L("审批请求", "approval request")
+        note = L(f"（理由：{reason.strip()}）", f"(reason: {reason.strip()})") if reason.strip() else ""
         self._perm_update(msg_ts,
-                          f"❌ {summary}\n已由 {who or '人工'} 拒绝{note}")
+                          L(f"❌ {summary}\\n已由 {who or '人工'} 拒绝{note}", f"❌ {summary}\ndenied by {who or 'human'}{note}"))
         if s:
             self._run_prompt(
                 root,
-                f"用户拒绝了审批请求「{summary}」。"
-                + (f"理由：{reason.strip()}" if reason.strip() else "")
-                + "请据此调整做法后继续。")
+                L(f"用户拒绝了审批请求「{summary}」。", f'the user denied the approval request "{summary}".')
+                + (L(f"理由：{reason.strip()}", f"reason: {reason.strip()}") if reason.strip() else "")
+                + L("请据此调整做法后继续。", "please adjust your approach accordingly and continue."))
 
     def _post_perm(self, root, summary, rid, options):
         """One Block Kit button per permission option; the clicked
@@ -5065,7 +5152,7 @@ class SessionBridge:
         blocks = [
             {"type": "section",
              "text": {"type": "mrkdwn",
-                      "text": f"⚠️ 待审批：{slack_md(summary)}"}},
+                      "text": L(f"⚠️ 待审批：{slack_md(summary)}", f"⚠️ pending approval: {slack_md(summary)}")}},
             {"type": "actions",
              "block_id": f"perm_{rid}",
              "elements": elements},
@@ -5073,20 +5160,20 @@ class SessionBridge:
              "elements": [{
                  "type": "button",
                  "text": {"type": "plain_text",
-                          "text": "✏️ 拒绝并附言"},
+                          "text": L("✏️ 拒绝并附言", "✏️ Deny with note")},
                  "action_id": "perm_reason",
                  "value": json.dumps({"rid": rid})}]},
             {"type": "context",
              "elements": [{"type": "mrkdwn",
-                           "text": f"{_perm_timeout_hint()}"
-                                   " · 也可回复 允许 / 拒绝"}]},
+                           "text": f"{_perm_timeout_hint()}" +
+                                   L(" · 也可回复 允许 / 拒绝", " · or reply allow / deny")}]},
         ]
         try:
-            return self.post_msg(root, "⚠️ 待审批：" +
+            return self.post_msg(root, L("⚠️ 待审批：", "⚠️ Pending approval:") +
                                  slack_md(summary), blocks=blocks)
         except TypeError:
-            return self.post(root, f"⚠️ 待审批 {rid}: {summary}\n"
-                                   "回复「允许」或「拒绝」。")
+            return self.post(root, L(f"⚠️ 待审批 {rid}: {summary}\\n", f"⚠️ pending approval {rid}: {summary}\n") +
+                                   L("回复「允许」或「拒绝」。", 'reply "allow" or "deny".'))
         except Exception as e:
             self._log_err("perm post", e)
             return None
@@ -5118,7 +5205,7 @@ class SessionBridge:
         if not text and not files:
             return
         if files and not text:
-            text = "（见附件）"
+            text = L("（见附件）", "(see attachment)")
         low = text.lower()
         # "!" is the command prefix: a known bridge command runs
         # locally; anything else is rewritten to "/…" and forwarded to
@@ -5153,8 +5240,8 @@ class SessionBridge:
                 if not busy and read_state(self._workdir(ts)) is not None:
                     busy = True
                 if busy:
-                    self.post(ts, "该线程已有会话记录，未重复执行；"
-                                  "请在原线程回复继续，或发新根消息开新任务。")
+                    self.post(ts, L("该线程已有会话记录，未重复执行；", "this thread already has a session; not re-running;") +
+                                  L("请在原线程回复继续，或发新根消息开新任务。", "reply in the original thread to continue, or post a new top-level message for a new task."))
                     return
                 if queued:
                     return
@@ -5170,10 +5257,10 @@ class SessionBridge:
                 if queue_it:
                     wd = self._workdir(ts)
                     self._seed_workdir(wd, ts)
-                    write_state(wd, "queued", "", "等待自动任务槽位")
-                    self.post(ts, "已有自动任务在运行，本任务排队中（第 "
-                                  f"{len(self.dispatch_queue)} 位）；"
-                                  "回复\"停止\"可取消排队。")
+                    write_state(wd, "queued", "", L("等待自动任务槽位", "waiting for an auto-task slot"))
+                    self.post(ts, L("已有自动任务在运行，本任务排队中（第 ", "an auto task is already running; this task queued (#") +
+                                  L(f"{len(self.dispatch_queue)} 位）；", f"{len(self.dispatch_queue)});") +
+                                  L('回复\\"停止\\"可取消排队。', 'reply "stop" to cancel the queue.'))
                     self._reap_idle_auto()
                     self._pump_queue()
                     return
@@ -5184,8 +5271,8 @@ class SessionBridge:
                     f"<@{self.own_user_id}>" in ev.get("text", ""):
                 # Mentioned mid-message: matching is anchored at the
                 # start, so without a hint this silently does nothing.
-                self.post(ts, "收到 @我：请把 @我 放在消息开头并带上"
-                              "任务内容，我才能接单。")
+                self.post(ts, L("收到 @我：请把 @我 放在消息开头并带上", "Got the @me: put the mention at the start of the message with") +
+                              L("任务内容，我才能接单。", "task content for me to pick it up."))
             return
         if low in STOP_WORDS:
             self._stop(root)
@@ -5193,7 +5280,7 @@ class SessionBridge:
             self._goal_clear_cmd(root)
         elif low in RELOAD_WORDS:
             self.request_reload()
-            self.post(root, "收到，桥服务热重启（在跑的会话不中断）。")
+            self.post(root, L("收到，桥服务热重启（在跑的会话不中断）。", "got it — bridge hot-restarting (running sessions unaffected)."))
         elif low in STATUS_WORDS:
             self._status(root)
         elif low in LIMIT_WORDS:
@@ -5216,7 +5303,7 @@ class SessionBridge:
             elif s.queued and \
                     time.monotonic() - s.last_queue_notice > 60:
                 s.last_queue_notice = time.monotonic()
-                self.post(root, "⏸ 收到，已排队——前面还有你的消息没处理完。")
+                self.post(root, L("⏸ 收到，已排队——前面还有你的消息没处理完。", "⏸ Got it, queued — your earlier message is still being processed."))
             self._react(ts, "eyes")
             threading.Thread(target=self._run_prompt,
                              args=(root, text, files, ts),
@@ -5232,8 +5319,8 @@ class SessionBridge:
                         q[0], (q[1] + "\n" + text).strip(),
                         (q[2] or []) + (files or []))
                     pos += 1
-            self.post(root, "任务在排队中" +
-                      (f"（第 {pos} 位），此回复已并入任务内容。"
+            self.post(root, L("任务在排队中", "task is queued") +
+                      (L(f"（第 {pos} 位），此回复已并入任务内容。", f"(#{pos}); this reply was merged into the task.")
                        if pos else "。"))
         else:
             wd = self._workdir(root)
@@ -5256,9 +5343,9 @@ class SessionBridge:
                                        st["session_id"]),
                                  daemon=True).start()
             elif MENTION.match(ev.get("text", "")):
-                tail = f"（上次：{fmt_state(st)}）" if st else ""
-                self.post(root, f"该线程没有活跃会话{tail}；"
-                                "开新任务请发新根消息并@我。")
+                tail = L(f"（上次：{fmt_state(st)}）", f"(last: {fmt_state(st)})") if st else ""
+                self.post(root, L(f"该线程没有活跃会话{tail}；", f"no active session on this thread{tail};") +
+                                L("开新任务请发新根消息并@我。", "to start a new task, post a new top-level message and @me."))
 
     def reaper(self):
         while True:
@@ -5275,11 +5362,11 @@ class SessionBridge:
                 if s:
                     dead = s.terminate()
                     write_state(s.workdir, "reaped", s.last_activity,
-                                "空闲超时回收")
-                    self._finish(ts, s, "zzz", "💤 空闲回收")
-                    self.post(ts, "会话空闲超时已回收"
-                              + ("" if dead else "（进程退出未确认）")
-                              + "；继续发言请开新任务。")
+                                L("空闲超时回收", "idle-timeout reaped"))
+                    self._finish(ts, s, "zzz", L("💤 空闲回收", "💤 Idle reaped"))
+                    self.post(ts, L("会话空闲超时已回收", "idle-timeout session reaped")
+                              + ("" if dead else L("（进程退出未确认）", "(process exit unconfirmed)"))
+                              + L("；继续发言请开新任务。", "; to keep going, start a new task."))
             self._pump_queue()
 
 
@@ -5430,24 +5517,24 @@ def main():
     for ts, st in interrupted:
         bridge._react_state(ts, REACT_RELOADING)
         if time.time() - st.get("updated", 0) < 86400:
-            bridge.post(ts, "🔄 桥服务已重启，本会话中断；"
-                            "回复本线程可自动恢复上下文。")
+            bridge.post(ts, L("🔄 桥服务已重启，本会话中断；", "🔄 Bridge restarted, this session was interrupted;") +
+                            L("回复本线程可自动恢复上下文。", "reply in this thread to auto-restore context."))
     if restored or adopted or interrupted or limited:
         print(f"[info] startup: {len(restored)} live-restored, "
               f"{len(adopted)} inflight-adopted, "
               f"{len(limited)} limit-parked, "
               f"{len(interrupted)} interrupted", flush=True)
-        # One channel-level line replaces per-thread "会话保持"
+        # One channel-level line replaces per-thread L("会话保持", "session kept")
         # posts: with N sessions a reload used to cost 2-4 messages
         # per thread.
         if restored or adopted or limited:
-            bits = [f"接管 {len(restored)} 个会话"] if restored else []
+            bits = [L(f"接管 {len(restored)} 个会话", f"adopted {len(restored)} sessions")] if restored else []
             if adopted:
-                bits.append(f"{len(adopted)} 个未跑完回合续跑")
+                bits.append(L(f"{len(adopted)} 个未跑完回合续跑", f"{len(adopted)} unfinished turns resumed"))
             if limited:
-                bits.append(f"{len(limited)} 个限额回合排队冷却")
-            bridge.post(None, "🔄 桥已热重启：" + "，".join(bits) +
-                            "，线程里继续即可。")
+                bits.append(L(f"{len(limited)} 个限额回合排队冷却", f"{len(limited)} limited turns parked to cool down"))
+            bridge.post(None, L("🔄 桥已热重启：", "🔄 Bridge hot-restarted:") + "，".join(bits) +
+                            L("，线程里继续即可。", "; just continue in the thread."))
 
     def handle(client, req: SocketModeRequest):
         if req.type == "events_api":

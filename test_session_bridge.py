@@ -14,6 +14,8 @@ import time
 import unittest
 from urllib.error import URLError
 
+# The tests assert zh UI strings; pin the UI language before import.
+os.environ.setdefault("BRIDGE_LANG", "zh")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import session_bridge as sb
 
@@ -2691,6 +2693,70 @@ def _exec_helper_phase2(meta_path):
     assert "任务结果" in reply2, reply2
     s.terminate()
     print("EXEC_RESTORE_PASS", flush=True)
+
+
+class I18nTest(unittest.TestCase):
+    """BRIDGE_LANG selects UI strings; public-safe feature defaults."""
+
+    def _fresh(self, env_extra, expr):
+        """Import session_bridge in a clean subprocess with env."""
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith(("BRIDGE_LANG", "AUTOCLEAN",
+                                    "AUDIT_ENABLED", "BRIDGE_PAD"))}
+        env.update(env_extra)
+        env["PYTHONPATH"] = os.path.dirname(os.path.abspath(__file__))
+        r = subprocess.run(
+            [sys.executable, "-c",
+             "import session_bridge as sb\n" + expr],
+            capture_output=True, text=True, env=env, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr[-1500:])
+        return r.stdout
+
+    def test_default_lang_is_english(self):
+        out = self._fresh({}, "print('桥命令' not in sb.HELP_CARD, "
+                            "'Bridge commands' in sb.HELP_CARD)")
+        self.assertIn("True True", out)
+
+    def test_zh_lang(self):
+        out = self._fresh({"BRIDGE_LANG": "zh"},
+                          "print('桥命令' in sb.HELP_CARD, "
+                          "'桥会话上下文' in sb.AGENTS_TMPL)")
+        self.assertIn("True True", out)
+
+    def test_en_templates(self):
+        out = self._fresh({"BRIDGE_LANG": "en"},
+                          "print('Bridge session context' in sb.AGENTS_TMPL, "
+                          "'self-audit' in sb.AUDIT_PROMPT)")
+        self.assertIn("True True", out)
+
+    def test_autoclean_opt_in(self):
+        out = self._fresh({}, "print(sb.AUTOCLEAN)")
+        self.assertIn("False", out)
+        out = self._fresh({"AUTOCLEAN": "1"}, "print(sb.AUTOCLEAN)")
+        self.assertIn("True", out)
+
+    def test_audit_opt_in(self):
+        out = self._fresh({}, "print(sb.AUDIT_ENABLED)")
+        self.assertIn("False", out)
+        out = self._fresh({"AUDIT_ENABLED": "1"}, "print(sb.AUDIT_ENABLED)")
+        self.assertIn("True", out)
+
+    def test_pad_requires_install(self):
+        # no ~/remote-pad in test env → forced off via BRIDGE_PAD=0
+        out = self._fresh({"BRIDGE_PAD": "0"}, "print(sb.PAD_ENABLED)")
+        self.assertIn("False", out)
+
+    def test_bilingual_input_words(self):
+        # command keyword sets stay bilingual regardless of BRIDGE_LANG
+        self.assertIn("stop", sb.STOP_WORDS)
+        self.assertIn("停止", sb.STOP_WORDS)
+        self.assertIn("status", sb.STATUS_WORDS)
+        self.assertIn("状态", sb.STATUS_WORDS)
+
+    def test_no_private_literals(self):
+        src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "session_bridge.py")).read()
+        self.assertNotIn("100.69.104.50", src)
 
 
 if __name__ == "__main__":
