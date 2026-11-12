@@ -102,6 +102,7 @@ import unicodedata
 import urllib.request
 from collections import Counter, deque
 
+import acct_pool
 import limit_governor
 
 # UI language: "en" (default) or "zh". Input parsing accepts both
@@ -418,6 +419,17 @@ LIMIT_EXT_POST = os.environ.get("BRIDGE_LIMIT_EXT_POST", "1") != "0"
 # for minutes, so locked sessions need real staleness before we even
 # watch them, let alone take them over.
 LIMIT_EXT_FRESH = float(os.environ.get("BRIDGE_LIMIT_EXT_FRESH", "600"))
+# Multi-account pool (acct_pool.py): org-scoped tokens minted into
+# BRIDGE_ACCT_POOL get sessions spread across them; an account the
+# upstream limits goes into the penalty box until the quoted reset and
+# its sessions migrate — the acp process is killed and session/load
+# brings the thread up on a healthy account. An explicit
+# DEVIN_ACP_API_KEY pins billing to one account and disables the pool.
+ACCT_POOL_FILE = os.environ.get(
+    "BRIDGE_ACCT_POOL", "~/.config/devin-bridge/accounts.json")
+ACCT_POOL_ENABLED = (
+    ACCT_POOL_FILE.strip().lower() not in ("", "0", "off", "none")
+    and not os.environ.get("DEVIN_ACP_API_KEY"))
 EXT_RESUME_PROMPT = os.environ.get(
     "BRIDGE_LIMIT_EXT_PROMPT",
     L("（自动恢复：服务端限额冷却已结束）请继续完成刚才被中断的工作；", "(auto-resume: server-side limit cooldown ended) please continue the interrupted work;") +
@@ -483,6 +495,7 @@ BANG_CMDS = {
     "model": "model", "mode": "mode",
     "reset": "reset", "new": "reset", "wipe": "reset",
     "limits": "limits", "limit": "limits", "cooldown": "limits",
+    "accts": "accts", "accounts": "accts", "账号": "accts",
     "sessions": "sessions", "ls": "sessions", "list": "sessions",
     "adopt": "adopt", "takeover": "adopt", "attach": "adopt",
     "handoff": "handoff", "handover": "handoff",
@@ -1116,7 +1129,8 @@ class _InheritedProc:
 class DevinSession:
     """One persistent `devin acp` process bound to one Slack thread."""
 
-    def __init__(self, thread_ts, workdir, cmd, timeout, acp_cwd=None):
+    def __init__(self, thread_ts, workdir, cmd, timeout, acp_cwd=None,
+                 acct=None):
         os.makedirs(workdir, exist_ok=True)
         self.thread_ts = thread_ts
         self.workdir = workdir
@@ -1126,6 +1140,10 @@ class DevinSession:
         # session whose home project lives elsewhere.
         self.acp_cwd = acp_cwd or workdir
         self.timeout = timeout
+        # acct: an acct_pool account dict — this process authenticates
+        # with its token and stays bound to that org until killed.
+        self.acct = acct
+        self.acct_id = (acct or {}).get("id")
         exe = shutil.which(cmd[0])
         if not exe:
             raise FileNotFoundError(L(f"{cmd[0]!r} 不在 PATH", f"{cmd[0]!r} not on PATH"))
@@ -1152,6 +1170,8 @@ class DevinSession:
         self.workdir = workdir
         self.timeout = timeout
         self.proc = _InheritedProc(pid, stdin_fd, stdout_fd)
+        self.acct = None
+        self.acct_id = None
         self._init_state()
         return self
 
@@ -1600,7 +1620,7 @@ class DevinSession:
         auth_methods = (((init_res or {}).get("result") or {})
                         .get("authMethods") or [])
         if auth_methods:
-            key = _acp_api_key()
+            key = ((self.acct or {}).get("token")) or _acp_api_key()
             if not key:
                 raise AcpError({
                     "message": L("devin 未认证: acp 不使用本地 CLI 凭据,", "devin not authenticated: acp doesn't use local CLI credentials,") +
@@ -1650,7 +1670,8 @@ class DevinSession:
             self._wait_result(m, deadline, lambda x: None)
         self._note(L("会话就绪", "session ready"))
         write_state(self.workdir, "idle", self.last_activity,
-                    extra={"session_id": self.session_id})
+                    extra={"session_id": self.session_id,
+                           "acct_id": self.acct_id})
         # session/load replays history as session/update chunks; drop
         # them so they are not re-emitted as the next reply.
         self.chunks = []
@@ -1897,6 +1918,8 @@ class SessionBridge:
         self.limit_attempts = {}
         self._ext_scan_at = 0.0
         self._acct = _acct_fingerprint()
+        self.acct_pool = (acct_pool.Pool(ACCT_POOL_FILE)
+                          if ACCT_POOL_ENABLED else None)
         # DM mirror boards: mobile can't reach channel pins/bookmarks,
         # so every known user gets a copy of the board as the latest
         # message in their DM with the bot — open Slack, tap the bot,
@@ -2371,6 +2394,7 @@ class SessionBridge:
                 "next_id": s.next_id, "auto": getattr(s, "auto", False),
                 "model_name": s.model_name, "mode_name": s.mode_name,
                 "mode_id": s.mode_id, "mode_names": s.mode_names,
+                "acct_id": getattr(s, "acct_id", None),
                 "config_options": s.config_options,
                 "slash_cmds": sorted(s.slash_cmds),
                 "goal": s.goal,
@@ -2516,6 +2540,7 @@ class SessionBridge:
             s.mode_name = d.get("mode_name")
             s.mode_id = d.get("mode_id")
             s.mode_names = d.get("mode_names") or {}
+            s.acct_id = d.get("acct_id")
             s.config_options = d.get("config_options") or {}
             s.slash_cmds = set(d.get("slash_cmds") or [])
             s.goal = d.get("goal")
@@ -2652,6 +2677,41 @@ class SessionBridge:
 
     # ---- limit governor -------------------------------------------
 
+    def _pool(self):
+        """Active acct pool or None (feature off / empty file)."""
+        p = self.acct_pool
+        if p is None:
+            return None
+        p.reload()
+        return p if p.enabled() else None
+
+    def _acct_loads(self):
+        """{acct_id: live session count} — the 'spread evenly' input."""
+        loads = Counter()
+        for s in self.sessions.values():
+            if s.alive and getattr(s, "acct_id", None):
+                loads[s.acct_id] += 1
+        for e in self.governor.snapshot():
+            a = e.get("acct")
+            if a:
+                loads[a] += 1
+        return loads
+
+    def _pick_acct(self, exclude=None):
+        p = self._pool()
+        if not p:
+            return None
+        return p.pick(loads=self._acct_loads(), exclude=exclude)
+
+    @staticmethod
+    def _dead_cred(exc):
+        """The token itself was rejected (revoked/expired) — mark the
+        account dead instead of retrying it."""
+        return bool(re.search(
+            r"unauthenticated|invalid.{0,30}(api.?key|token|credential)"
+            r"|token.{0,20}revoked|invalidated.{0,20}token|status.{0,10}401",
+            str(exc), re.IGNORECASE))
+
     def _limit_park(self, ts, s, text, msg_ts, exc):
         """Park a turn killed by a server-side limit into the cooldown
         registry. True → caller skips the failure card; False → not a
@@ -2667,6 +2727,53 @@ class SessionBridge:
         self.limit_attempts[ts] = attempt
         now = time.time()
         reset_at = info.get("reset_at")
+        acct_id = getattr(s, "acct_id", None)
+        p = self._pool()
+        # Penalty-box the account that produced the limit. The box is
+        # keyed by account id — sessions bound to it migrate instead of
+        # waiting out the window on a dead credential.
+        if p and acct_id:
+            p.mark_cooling(acct_id, reset_at or (now + LIMIT_BASE_BACKOFF))
+            self.governor.event(
+                "acct_cooling", acct=acct_id,
+                until=int(reset_at or now + LIMIT_BASE_BACKOFF))
+        alt = self._pick_acct() if p else None
+        if alt is not None:
+            # Healthy account available → migrate: kill the process
+            # holding the limited token and let the sweeper respawn the
+            # session on `alt`'s org via session/load.
+            entry = {"kind": "bridge", "text": text, "msg_ts": msg_ts,
+                     "session_id": getattr(s, "session_id", None),
+                     "error": info["message"][:300],
+                     "error_kind": info["kind"], "reset_at": reset_at,
+                     "resume_at": now + random.uniform(2, 8),
+                     "attempt": attempt, "acct": acct_id,
+                     "migrate_to": alt.get("id"),
+                     "live_sessions": sum(
+                         1 for x in self.sessions.values() if x.alive),
+                     "active_turns": sum(
+                         1 for x in self.sessions.values() if x.running)}
+            self.governor.park(ts, entry)
+            write_state(s.workdir, "rate_limited", s.last_activity,
+                        L(f"{info['kind']}，迁移到账号 {alt.get('id')} 重试",
+                          f"{info['kind']}, migrating to account {alt.get('id')}"),
+                        extra={"acct_id": acct_id})
+            self._react_state(ts, REACT_LIMITED)
+            self._status_line(s, L(f"⏸️ 限额 · 切换到账号 {alt.get('id')}",
+                                   f"⏸️ limited · switching to account {alt.get('id')}"))
+            self.post(ts, L(f"⏸️ 账号 {acct_id or '（桌面跟随）'} 触发限额（{info['kind']}），", f"⏸️ account {acct_id or '(desktop-follow)'} hit a limit ({info['kind']}),") +
+                          L(f"已切到账号 *{alt.get('id')}* 自动续跑。", f" migrating to account *{alt.get('id')}* and resuming.") +
+                          L("`!accts` 看账号池。", "`!accts` shows the pool."))
+            self.governor.event("acct_migrate", key=ts,
+                                from_acct=acct_id, to_acct=alt.get("id"),
+                                session=entry["session_id"])
+            # The parked entry is the single resume path: the sweeper
+            # dispatches it through _resume_session once RESUME_GAP
+            # lets a slot open, so only one acp ever owns the session.
+            s.terminate()
+            self._remove(ts)
+            self._board_touch()
+            return True
         if reset_at and reset_at > now:
             resume_at = reset_at + random.uniform(2, 12)
             wait_for = (L("到 ", "at ")
@@ -2684,7 +2791,7 @@ class SessionBridge:
             "session_id": getattr(s, "session_id", None),
             "error": info["message"][:300], "error_kind": info["kind"],
             "reset_at": reset_at, "resume_at": resume_at,
-            "attempt": attempt, "acct": _acct_fingerprint(),
+            "attempt": attempt, "acct": acct_id or _acct_fingerprint(),
             "live_sessions": live, "active_turns": active})
         write_state(s.workdir, "rate_limited", s.last_activity,
                     L(f"{info['kind']}，{wait_for}自动重试", f"{info['kind']}, auto-retry {wait_for}") +
@@ -2729,6 +2836,12 @@ class SessionBridge:
             return
         self.governor.event("acct_switch", prev=self._acct, acct=acct)
         self._acct = acct
+        if self._pool():
+            # Pool routing owns account choice now: a Desktop switch
+            # changes nothing about which token spawned a session, so
+            # it is not a reason to early-resume parked turns (doing so
+            # burned attempts on flap after flap of re-minted tokens).
+            return
         for e in self.governor.snapshot():
             key = e.get("key")
             if not key or e.get("suspect"):
@@ -2749,6 +2862,22 @@ class SessionBridge:
         key, entry = due[0]
         self.governor.pop(key, "dispatch")
         self.governor.last_resume_at = now
+        p = self._pool()
+        if p:
+            acct = self._pick_acct()
+            if acct is None:
+                # Every account is boxed or dead — wait for the
+                # earliest release instead of spending a resume attempt
+                # on a guaranteed refusal.
+                rel = p.earliest_release()
+                e2 = dict(entry)
+                e2["resume_at"] = (rel + random.uniform(5, 30)
+                                   if rel else now + 300)
+                self.governor.park(key, e2)
+                self.governor.event(
+                    "resume_wait_accounts", key=key,
+                    until=int(e2["resume_at"]))
+                return
         self.governor.event("resume_attempt", key=key,
                             attempt=entry.get("attempt"),
                             session=entry.get("session_id"))
@@ -2757,6 +2886,16 @@ class SessionBridge:
                              daemon=True).start()
             return
         s = self.sessions.get(key)
+        if p and s and s.alive and getattr(s, "session_id", None) \
+                and ((s.acct_id and not p.healthy_id(s.acct_id))
+                     or not s.acct_id):
+            # Either bound to an account still boxed, or a pre-pool
+            # session on an unknown (Desktop-follow) token — migrate:
+            # drop the stale-token process, the session_id path below
+            # respawns on a healthy org.
+            s.terminate()
+            self._remove(key)
+            s = None
         if s and s.alive:
             self.post(key, L("🔄 限额冷却结束，重试上一回合…", "🔄 Cooldown over, retrying last turn…"))
             threading.Thread(
@@ -2771,6 +2910,13 @@ class SessionBridge:
                       entry["session_id"]),
                 kwargs={"msg_ts": entry.get("msg_ts"),
                         "replayed": True},
+                daemon=True).start()
+        elif entry.get("fresh"):
+            threading.Thread(
+                target=self._new_session,
+                args=(key, entry.get("text") or RESUME_NUDGE,
+                      entry.get("files")),
+                kwargs={"queued": True},
                 daemon=True).start()
         else:
             self.governor.event("resume_skip", key=key,
@@ -2967,7 +3113,7 @@ class SessionBridge:
         s = None
         try:
             s = DevinSession(None, ext_wd, self.acp_cmd, self.timeout,
-                             acp_cwd=wd)
+                             acp_cwd=wd, acct=self._pick_acct())
             s.start(resume_id=sid, strict_load=True)
             reply, reason = s.prompt(EXT_RESUME_PROMPT,
                                      lambda *a: None,
@@ -2981,6 +3127,11 @@ class SessionBridge:
                                 L(f"`{sid}`（{title}）已自动续跑。", f"`{sid}` ({title}) auto-resumed."))
         except Exception as e:
             info = limit_governor.classify_error(e)
+            if info and getattr(s, "acct_id", None) and self.acct_pool:
+                self.acct_pool.mark_cooling(
+                    s.acct_id,
+                    info.get("reset_at") or time.time()
+                    + LIMIT_BASE_BACKOFF)
             if info and entry.get("attempt", 1) < LIMIT_RESUME_MAX:
                 e2 = dict(entry)
                 e2.pop("attempt", None)
@@ -3035,7 +3186,8 @@ class SessionBridge:
                 "kind": "bridge", "text": RESUME_NUDGE,
                 "session_id": st["session_id"],
                 "error": (detail or "resumed_after_restart")[:300],
-                "error_kind": "rate_limited", "acct": self._acct,
+                "error_kind": "rate_limited",
+                "acct": st.get("acct_id") or self._acct,
                 "resume_at": now + random.uniform(10, 40)})
             adopted.append(ts)
             self._react_state(ts, REACT_LIMITED)
@@ -3052,6 +3204,24 @@ class SessionBridge:
         parked = self.governor.snapshot()
         now = time.time()
         lines = []
+        p = self._pool()
+        if p:
+            loads = self._acct_loads()
+            bits = []
+            for a in p.accounts():
+                aid = a.get("id")
+                n = loads.get(aid, 0)
+                if a.get("dead"):
+                    bits.append(L(f"{aid}💀", f"{aid}💀"))
+                elif (a.get("cooling_until") or 0) > now:
+                    bits.append(aid + L("⏸️至", "⏸️til ") + time.strftime(
+                        "%H:%M", time.localtime(a["cooling_until"])))
+                else:
+                    bits.append(aid + "✅")
+                if n:
+                    bits[-1] += f"·{n}"
+            lines.append(L("*账号池* ", "*Account pool* ")
+                         + " · ".join(bits))
         if parked:
             lines.append(L("*冷却队列*", "*Cooldown queue*"))
             for e in parked:
@@ -3083,6 +3253,41 @@ class SessionBridge:
                 desc = (e.get("error") or "")[:60]
                 lines.append(f"• {t} `{e.get('event')}` {who}"
                              + (f" — {desc}" if desc else ""))
+        self.post(root, "\n".join(lines))
+
+    def _accts(self, root):
+        """!accts: account pool detail — state, load, last limit/ok."""
+        p = self._pool()
+        if not p:
+            self.post(root, L("账号池未启用（BRIDGE_ACCT_POOL 未配置或文件为空；DEVIN_ACP_API_KEY 已固定单号）。",
+                              "account pool not enabled (BRIDGE_ACCT_POOL unset/empty, or DEVIN_ACP_API_KEY pins one account)."))
+            return
+        now = time.time()
+        loads = self._acct_loads()
+        lines = [L("*账号池*（会话按负载均摊，限额的号自动关冷却）",
+                   "*Account pool* (sessions spread by load; limited accounts auto-box)")]
+        for a in p.accounts():
+            aid = a.get("id")
+            if a.get("dead"):
+                st = L("💀 失效", "💀 dead") + \
+                    (f" — {str(a.get('dead_reason'))[:60]}"
+                     if a.get("dead_reason") else "")
+            elif (a.get("cooling_until") or 0) > now:
+                st = L("⏸️ 冷却至 ", "⏸️ cooling until ") + time.strftime(
+                    "%m-%d %H:%M", time.localtime(a["cooling_until"]))
+            else:
+                st = "✅"
+            extra = []
+            if loads.get(aid):
+                extra.append(L(f"{loads[aid]} 会话", f"{loads[aid]} sessions"))
+            if a.get("last_limit_at"):
+                extra.append(L("上次限额 ", "last limited ") + time.strftime(
+                    "%m-%d %H:%M", time.localtime(a["last_limit_at"])))
+            if a.get("last_ok"):
+                extra.append(L("上次成功 ", "last ok ") + time.strftime(
+                    "%m-%d %H:%M", time.localtime(a["last_ok"])))
+            lines.append(f"• `{aid}` {st}"
+                         + (" — " + "，".join(extra) if extra else ""))
         self.post(root, "\n".join(lines))
 
     def _seed_workdir(self, workdir, ts):
@@ -3589,14 +3794,55 @@ class SessionBridge:
             # the live status card below, not a second message.
             ack_ts = self.post(ts, L("已接单，开始处理。", "accepted, working on it."))
         s = None
+        acct = None
+        tried = set()
         try:
-            s = DevinSession(ts, wd, self.acp_cmd, self.timeout)
-            s.notify = lambda msg: self.post(ts, msg)
-            s.on_text = lambda: self._draft_tick(ts)
-            s.notify_perm = lambda summ, rid, opts: \
-                self._post_perm(ts, summ, rid, opts)
-            s.perm_update = self._perm_update
-            s.start()
+            while True:
+                acct = self._pick_acct(exclude=tried)
+                p = self._pool()
+                if p and acct is None:
+                    rel = p.earliest_release()
+                    if tried or rel is None:
+                        raise RuntimeError(
+                            L("账号池无可用账号（token 失效或全部限额）",
+                              "no usable pool accounts (dead tokens or all limited)"))
+                    self.governor.park(ts, {
+                        "kind": "bridge", "text": text, "fresh": True,
+                        "error_kind": "rate_limited",
+                        "error": L("所有账号限额冷却中", "all accounts cooling"),
+                        "resume_at": rel + random.uniform(5, 30)})
+                    self.post(ts, L(f"⏸️ 所有 devin 账号都在限额冷却中，本任务排队等账号释放，最早 {time.strftime('%H:%M', time.localtime(rel))} 自动开跑。", f"⏸️ all devin accounts are cooling; queued for the earliest release ~{time.strftime('%H:%M', time.localtime(rel))}."))
+                    with self.lock:
+                        self.starting.discard(ts)
+                        self.starting_auto.discard(ts)
+                    self._pump_queue()
+                    return
+                try:
+                    s = DevinSession(ts, wd, self.acp_cmd, self.timeout,
+                                     acct=acct)
+                    s.notify = lambda msg: self.post(ts, msg)
+                    s.on_text = lambda: self._draft_tick(ts)
+                    s.notify_perm = lambda summ, rid, opts: \
+                        self._post_perm(ts, summ, rid, opts)
+                    s.perm_update = self._perm_update
+                    s.start()
+                except Exception as e:
+                    if s is not None:
+                        s.terminate()
+                        s = None
+                    if acct and self.acct_pool and self._dead_cred(e):
+                        self.acct_pool.mark_dead(acct["id"],
+                                                 str(e)[:200])
+                        self.governor.event("acct_dead",
+                                            acct=acct["id"])
+                        tried.add(acct["id"])
+                        continue
+                    raise
+                if acct and self.acct_pool:
+                    self.acct_pool.mark_ok(acct["id"])
+                    self.governor.event("acct_bind", key=ts,
+                                        acct=acct["id"])
+                break
         except Exception as e:
             if s is not None:
                 s.terminate()
@@ -3641,13 +3887,67 @@ class SessionBridge:
                     pass
             if ack_post:
                 ack_ts = self.post(root, L("已接单，正在恢复旧会话…", "accepted, restoring previous session…"))
-            s = DevinSession(root, wd, self.acp_cmd, self.timeout)
-            s.notify = lambda msg: self.post(root, msg)
-            s.on_text = lambda: self._draft_tick(root)
-            s.notify_perm = lambda summ, rid, opts: \
-                self._post_perm(root, summ, rid, opts)
-            s.perm_update = self._perm_update
-            s.start(resume_id=session_id)
+            acct = None
+            tried = set()
+            while True:
+                acct = self._pick_acct(exclude=tried)
+                p = self._pool()
+                if p and acct is None:
+                    rel = p.earliest_release()
+                    if tried or rel is None:
+                        raise RuntimeError(
+                            L("账号池无可用账号（token 失效或全部限额）",
+                              "no usable pool accounts"))
+                    self.governor.park(root, {
+                        "kind": "bridge", "text": text,
+                        "msg_ts": msg_ts, "session_id": session_id,
+                        "error_kind": "rate_limited",
+                        "error": L("所有账号限额冷却中", "all accounts cooling"),
+                        "resume_at": rel + random.uniform(5, 30)})
+                    self.post(root, L(f"⏸️ 所有 devin 账号都在限额冷却中，恢复排队等账号释放，最早 {time.strftime('%H:%M', time.localtime(rel))}。", f"⏸️ all devin accounts cooling; resume queued for earliest release ~{time.strftime('%H:%M', time.localtime(rel))}."))
+                    with self.lock:
+                        self.starting.discard(root)
+                    self._pump_queue()
+                    return
+                try:
+                    s = DevinSession(root, wd, self.acp_cmd, self.timeout,
+                                     acct=acct)
+                    s.notify = lambda msg: self.post(root, msg)
+                    s.on_text = lambda: self._draft_tick(root)
+                    s.notify_perm = lambda summ, rid, opts: \
+                        self._post_perm(root, summ, rid, opts)
+                    s.perm_update = self._perm_update
+                    s.start(resume_id=session_id)
+                except Exception as e:
+                    if s is not None:
+                        s.terminate()
+                        s = None
+                    if acct and self.acct_pool:
+                        if self._dead_cred(e):
+                            self.acct_pool.mark_dead(acct["id"],
+                                                     str(e)[:200])
+                            self.governor.event("acct_dead",
+                                                acct=acct["id"])
+                            tried.add(acct["id"])
+                            continue
+                        info = limit_governor.classify_error(e)
+                        if info:
+                            # The handoff itself hit this account's
+                            # limit — box it and try the next org.
+                            self.acct_pool.mark_cooling(
+                                acct["id"],
+                                info.get("reset_at")
+                                or time.time() + LIMIT_BASE_BACKOFF)
+                            self.governor.event(
+                                "acct_cooling", acct=acct["id"])
+                            tried.add(acct["id"])
+                            continue
+                    raise
+                if acct and self.acct_pool:
+                    self.acct_pool.mark_ok(acct["id"])
+                    self.governor.event("acct_bind", key=root,
+                                        acct=acct["id"])
+                break
         except Exception as e:
             if s is not None:
                 s.terminate()
@@ -3940,6 +4240,8 @@ class SessionBridge:
             self._cfg_cmd(root, arg, cmd)
         elif cmd == "limits":
             self._limits(root, arg)
+        elif cmd == "accts":
+            self._accts(root)
         elif cmd == "peek":
             self._peek(root, arg)
         elif cmd == "board":
@@ -4229,7 +4531,8 @@ class SessionBridge:
         s = None
         try:
             s = DevinSession(root, wd, self.acp_cmd, self.timeout,
-                             acp_cwd=None if gone else acp_cwd or None)
+                             acp_cwd=None if gone else acp_cwd or None,
+                             acct=self._pick_acct())
             s.notify = lambda msg: self.post(root, msg)
             s.on_text = lambda: self._draft_tick(root)
             s.notify_perm = lambda summ, rid, opts: \

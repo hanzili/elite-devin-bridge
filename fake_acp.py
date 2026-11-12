@@ -209,6 +209,13 @@ def main():
                 send({"jsonrpc": "2.0", "id": mid, "result": result})
         elif method == "authenticate":
             authed[0] = True
+            try:
+                key = ((msg.get("params") or {}).get("_meta") or {}) \
+                    .get("api_key") or ""
+                with open(".acp_key", "w") as f:
+                    f.write(key)
+            except OSError:
+                pass
             send({"jsonrpc": "2.0", "id": mid, "result": {}})
         elif method == "session/new":
             if os.environ.get("FAKE_REQUIRE_AUTH") and not authed[0]:
@@ -302,6 +309,20 @@ def main():
                                 "model. Your limit will reset in "
                                 "2 seconds (at Nov 10 00:00 UTC)."}})
                 continue
+            limit_key = os.environ.get("FAKE_LIMIT_KEY")
+            if limit_key:
+                try:
+                    cur = open(".acp_key").read().strip()
+                except OSError:
+                    cur = ""
+                if cur == limit_key:
+                    send({"jsonrpc": "2.0", "id": mid,
+                          "error": {"code": -32603,
+                                    "message": "Reached free model rate "
+                                    "limit. Please switch to a different "
+                                    "model. Your limit will reset in "
+                                    "90 seconds (at Nov 12 00:00 UTC)."}})
+                    continue
             if MODE == "unavailable" and \
                     not os.path.exists(".unavailable"):
                 open(".unavailable", "w").close()

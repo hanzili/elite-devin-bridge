@@ -14,6 +14,11 @@ import limit_governor as lg
 import session_bridge as sb
 import test_session_bridge as tsb
 
+# Pool-routing is off for these tests — they assert the legacy
+# single-account behavior (early-resume on acct switch, live-session
+# resume). Pool tests live in test_acct_pool.py.
+sb.ACCT_POOL_ENABLED = False
+
 RATE_MSG = ("Reached free model rate limit. Upgrade to Max for higher "
             "limits, or switch to a different model. Your limit will "
             "reset in 14 hours 52 minutes (at Nov 8 04:01 UTC).")

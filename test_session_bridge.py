@@ -19,6 +19,10 @@ os.environ.setdefault("BRIDGE_LANG", "zh")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import session_bridge as sb
 
+# Account-pool routing is off for these tests — they exercise the
+# legacy single-credential path; pool tests live in test_acct_pool.py.
+sb.ACCT_POOL_ENABLED = False
+
 FAKE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                     "fake_acp.py")
 CHANNEL = "C1"
