@@ -3312,6 +3312,10 @@ class SessionBridge:
             try:
                 with open(agents, "w") as f:
                     f.write(AGENTS_TMPL.format(mem=mem, ts=ts))
+                    rules = os.path.expanduser(os.environ.get("BRIDGE_AGENT_RULES", ""))
+                    if rules and os.path.exists(rules):
+                        f.write(L("\n## 必读规范\n\n- 开工前先读并遵守：{}\n",
+                                  "\n## Required rules\n\n- Read and follow before starting: {}\n").format(rules))
             except OSError:
                 pass
 
