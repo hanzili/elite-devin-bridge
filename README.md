@@ -126,7 +126,10 @@ Slack (Socket Mode) ──▶ session_bridge.py ──▶ devin acp (per thread)
 4. **Agent** — install the [Devin CLI](https://devin.ai) so `devin acp`
    is on PATH, and log in (`devin auth login` or Devin Desktop; the
    bridge picks up the credential at session start).
-5. **Service** — `cp session-bridge.service ~/.config/systemd/user/`,
+5. **Verify** — `python3 session_bridge.py --check` runs the onboarding
+   doctor: env file, tokens, Slack auth, channel access, agent binary
+   and workdir, each with a fix hint.
+6. **Service** — `cp session-bridge.service ~/.config/systemd/user/`,
    `systemctl --user daemon-reload && systemctl --user start
    session-bridge`. The unit uses `FileDescriptorStoreMax` +
    `KillMode=process` so `systemctl restart` preserves live sessions;

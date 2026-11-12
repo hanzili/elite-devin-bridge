@@ -10,24 +10,16 @@
  },
  "oauth_config": {
   "scopes": {
-   "user": [
-    "admin"
-   ],
+   "user": [],
    "bot": [
     "app_mentions:read",
     "assistant:write",
     "bookmarks:read",
     "bookmarks:write",
-    "calls:read",
-    "calls:write",
     "canvases:read",
     "canvases:write",
     "channels:history",
-    "channels:join",
-    "channels:manage",
     "chat:write",
-    "commands",
-    "emoji:read",
     "files:read",
     "files:write",
     "groups:history",
@@ -35,9 +27,7 @@
     "pins:read",
     "pins:write",
     "reactions:read",
-    "reactions:write",
-    "remote_files:read",
-    "search:read.files"
+    "reactions:write"
    ]
   },
   "pkce_enabled": false

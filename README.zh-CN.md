@@ -107,7 +107,10 @@ Slack (Socket Mode) ──▶ session_bridge.py ──▶ devin acp (per thread)
 4. **Agent** —— 装 [Devin CLI](https://devin.ai) 让 `devin acp` 在
    PATH 上，并登录（`devin auth login` 或 Devin Desktop；桥在会话
    启动时自取凭据）。
-5. **服务** —— `cp session-bridge.service ~/.config/systemd/user/`，
+5. **自检** —— `python3 session_bridge.py --check` 跑装机体检：
+   env 文件、token、Slack 鉴权、频道可达、agent 二进制、工作目录，
+   逐项给修复提示。
+6. **服务** —— `cp session-bridge.service ~/.config/systemd/user/`，
    `systemctl --user daemon-reload && systemctl --user start
    session-bridge`。unit 配了 `FileDescriptorStoreMax` +
    `KillMode=process`，`systemctl restart` 不丢活会话；

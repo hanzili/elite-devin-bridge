@@ -5573,7 +5573,100 @@ def main():
         socket.close()
 
 
+def _check():
+    """`--check` onboarding doctor: verify env, credentials, agent
+    binary and workspace access. Exits non-zero on hard failures."""
+    env_file = os.environ.get(
+        "BRIDGE_ENV_FILE",
+        os.path.expanduser("~/.config/devin-bridge/env"))
+    loaded = 0
+    try:
+        for ln in open(env_file):
+            ln = ln.strip()
+            if ln and not ln.startswith("#") and "=" in ln:
+                k, v = ln.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip())
+                loaded += 1
+    except OSError:
+        pass
+    ok_all = True
+
+    def rep(ok, label, detail="", warn=False):
+        nonlocal ok_all
+        mark = "✅" if ok else ("⚠️ " if warn else "❌")
+        if not ok and not warn:
+            ok_all = False
+        print(f" {mark} {label}" + (f" — {detail}" if detail else ""))
+
+    v = sys.version_info
+    rep(v >= (3, 10), "Python", f"{v.major}.{v.minor}" +
+        ("" if v >= (3, 10) else " — 3.10+ required"))
+    try:
+        import slack_sdk  # noqa: F401
+        from importlib.metadata import version as _iv
+        try:
+            sdkv = _iv("slack_sdk")
+        except Exception:
+            sdkv = "installed"
+        rep(True, "slack-sdk", sdkv)
+    except ImportError:
+        rep(False, "slack-sdk", "pip install slack-sdk")
+    rep(loaded > 0, "env file", env_file +
+        ("" if loaded else " — copy env.example and fill it in"),
+        warn=(loaded == 0))
+    tok = os.environ.get("SLACK_BOT_TOKEN", "")
+    rep(tok.startswith("xoxb-"), "SLACK_BOT_TOKEN",
+        "set" if tok else "missing")
+    rep(os.environ.get("SLACK_APP_TOKEN", "").startswith("xapp-"),
+        "SLACK_APP_TOKEN",
+        "set" if os.environ.get("SLACK_APP_TOKEN") else "missing")
+    rep(bool(os.environ.get("SLACK_CHANNEL_ID")), "SLACK_CHANNEL_ID",
+        os.environ.get("SLACK_CHANNEL_ID", "missing"))
+    if tok.startswith("xoxb-"):
+        try:
+            from slack_sdk import WebClient
+            web = WebClient(token=tok, timeout=15)
+            a = web.auth_test()
+            rep(True, "Slack auth",
+                f"bot={a.get('bot_id')} team={a.get('team')}")
+            ch = os.environ.get("SLACK_CHANNEL_ID")
+            if ch:
+                try:
+                    web.pins_list(channel=ch)
+                    rep(True, "channel access", ch)
+                except Exception as e:
+                    rep(False, "channel access",
+                        f"{e} — invite the bot to the channel")
+        except Exception as e:
+            rep(False, "Slack auth", str(e))
+    devin = os.environ.get("DEVIN_ACP", "devin acp").split()[0]
+    import shutil
+    path = shutil.which(devin)
+    rep(bool(path), f"agent binary `{devin}`", path or "not on PATH")
+    try:
+        _acp_api_key()
+        rep(True, "ACP credential", "resolvable")
+    except Exception as e:
+        rep(False, "ACP credential",
+            f"{e} — run `devin auth login` or set DEVIN_ACP_API_KEY",
+            warn=True)
+    try:
+        os.makedirs(TASKS_DIR, exist_ok=True)
+        t = os.path.join(TASKS_DIR, ".probe")
+        open(t, "w").close()
+        os.unlink(t)
+        rep(True, "tasks dir", TASKS_DIR)
+    except OSError as e:
+        rep(False, "tasks dir", f"{TASKS_DIR}: {e}")
+    print("\n" + ("all good — start with `python3 session_bridge.py` "
+                  "or the systemd unit" if ok_all else
+                  "fix the ❌ items above and re-run --check"))
+    return 0 if ok_all else 1
+
+
 if __name__ == "__main__":
+    if "--check" in sys.argv:
+        sys.exit(_check())
     if "--approvals" in sys.argv:
         print(json.dumps(collect_approvals(TASKS_DIR),
                          ensure_ascii=False, indent=1))
