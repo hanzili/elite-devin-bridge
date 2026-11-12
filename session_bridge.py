@@ -480,6 +480,7 @@ BANG_CMDS = {
     "allow": "allow", "approve": "allow", "yes": "allow", "y": "allow",
     "deny": "deny", "reject": "deny", "no": "deny", "n": "deny",
     "approvals": "approvals", "perms": "approvals", "perm": "approvals",
+    "model": "model", "mode": "mode",
     "reset": "reset", "new": "reset", "wipe": "reset",
     "limits": "limits", "limit": "limits", "cooldown": "limits",
     "sessions": "sessions", "ls": "sessions", "list": "sessions",
@@ -510,6 +511,8 @@ HELP_CARD = L("""*桥命令*（`!` 开头是命令，不带 `!` 就是聊天）
 • `!adopt [会话id]` — 接管桌面/CLI 会话到本线程；不带 id 接管最近一个
 • `!handoff` — 显示本线程会话 id，桌面 `devin -r` 或会话列表接管
 • `!release` — 桥松开本线程会话（上下文保留，随时可再接回）
+• `!model` — 当前模型；`!model <名|id>` 切换；`!model list` 列全部（Fusion 写完整 fusion-… id）
+• `!mode <模式>` — 切执行模式：plan / ask / smart / accept-edits / bypass
 • `!limits` — 限额冷却队列（哪些回合在等重试、何时自动续跑）
 • `!peek [会话id]` — 只看不动：最近几条动态（不接管不抢锁）
 • `!board` — 原地弹一份即时看板（只你可见）；频道名下面书签直达置顶看板
@@ -521,7 +524,7 @@ HELP_CARD = L("""*桥命令*（`!` 开头是命令，不带 `!` 就是聊天）
 • `!shot` — 截一张电脑桌面发上来（首次需在本机点一次共享）
 • `!reload` — 桥服务热重启，在跑的会话不中断
 • `!help` — 本卡片
-其它 `!命令` 原样发给会话（如 `!mode`、`!clear`）。
+其它 `!命令` 原样发给会话（如 `!goal`、`!clear`）。
 也能直接说中文：停止 / 取消目标 / 状态 / 桥重启 / 允许 / 拒绝 / 审批。""",
 """*Bridge commands* (`!`-prefixed are commands; plain text chats)
 • `!stop` — stop the current run; clears any attached goal
@@ -534,6 +537,8 @@ HELP_CARD = L("""*桥命令*（`!` 开头是命令，不带 `!` 就是聊天）
 • `!adopt [session-id]` — pull a Desktop/CLI session into this thread; no id adopts the latest
 • `!handoff` — show this thread's session id for `devin -r` or Desktop
 • `!release` — release the session (context kept; re-adopt any time)
+• `!model` — current model; `!model <name|id>` switches; `!model list` lists all (fusion needs the full fusion-… id)
+• `!mode <mode>` — switch run mode: plan / ask / smart / accept-edits / bypass
 • `!limits` — rate-limit cooldown queue (parked turns, retry times)
 • `!peek [session-id]` — look without touching: recent activity, no lock
 • `!board` — an ephemeral live board only you can see; the channel bookmark jumps to the pinned board
@@ -541,7 +546,7 @@ HELP_CARD = L("""*桥命令*（`!` 开头是命令，不带 `!` 就是聊天）
 • `!send <name|all>` — pull files: one by name or all pending
 • `!reload` — hot-restart the bridge; running sessions unaffected
 • `!help` — this card
-Any other `!cmd` is passed to the session as a slash command (e.g. `!mode`, `!clear`).""")
+Any other `!cmd` is passed to the session as a slash command (e.g. `!goal`, `!clear`).""")
 TERMINAL = {"finished", "stopped", "failed", "timeout", "crashed",
             "interrupted", "reaped"}
 CRASH_RESUME_MAX = 2
@@ -1186,7 +1191,9 @@ class DevinSession:
         self.slash_cmds = set()
         self.mode_names = {}
         self.mode_name = None
+        self.mode_id = None
         self.model_name = None
+        self.config_options = {}
         self._tool_titles = {}
         self.recent = deque(maxlen=8)
         self.tool_count = 0
@@ -1322,6 +1329,7 @@ class DevinSession:
             elif kind == "current_mode_update":
                 cid = upd.get("currentModeId")
                 if cid:
+                    self.mode_id = cid
                     self.mode_name = self.mode_names.get(cid, cid)
             elif kind == "available_commands_update":
                 for c in upd.get("availableCommands") or []:
@@ -1356,12 +1364,21 @@ class DevinSession:
                 self.mode_names[m["id"]] = m.get("name") or m["id"]
         cur = (result.get("modes") or {}).get("currentModeId")
         if cur:
+            self.mode_id = cur
             self.mode_name = self.mode_names.get(cur, cur)
         for opt in result.get("configOptions") or []:
-            if opt.get("id") == "model":
-                names = {o.get("value"): o.get("name")
-                         for o in opt.get("options") or []}
-                val = opt.get("currentValue")
+            oid = opt.get("id")
+            if not oid:
+                continue
+            names = {o.get("value"): o.get("name")
+                     for o in opt.get("options") or []}
+            val = opt.get("currentValue")
+            slot = self.config_options.setdefault(
+                oid, {"current": None, "options": {}})
+            slot["options"].update(names)
+            if val is not None:
+                slot["current"] = val
+            if oid == "model" and val is not None:
                 self.model_name = names.get(val) or val
 
     def _handle_permission(self, msg):
@@ -2353,7 +2370,8 @@ class SessionBridge:
                 "stdin_fd": inf, "stdout_fd": outf,
                 "next_id": s.next_id, "auto": getattr(s, "auto", False),
                 "model_name": s.model_name, "mode_name": s.mode_name,
-                "mode_names": s.mode_names,
+                "mode_id": s.mode_id, "mode_names": s.mode_names,
+                "config_options": s.config_options,
                 "slash_cmds": sorted(s.slash_cmds),
                 "goal": s.goal,
                 "goal_elapsed": (time.monotonic() - s.goal_started_at
@@ -2496,7 +2514,9 @@ class SessionBridge:
             s.auto = d.get("auto", False)
             s.model_name = d.get("model_name")
             s.mode_name = d.get("mode_name")
+            s.mode_id = d.get("mode_id")
             s.mode_names = d.get("mode_names") or {}
+            s.config_options = d.get("config_options") or {}
             s.slash_cmds = set(d.get("slash_cmds") or [])
             s.goal = d.get("goal")
             if d.get("goal_elapsed"):
@@ -3916,6 +3936,8 @@ class SessionBridge:
             self._handoff(root)
         elif cmd == "release":
             self._release(root)
+        elif cmd in ("model", "mode"):
+            self._cfg_cmd(root, arg, cmd)
         elif cmd == "limits":
             self._limits(root, arg)
         elif cmd == "peek":
@@ -3962,6 +3984,109 @@ class SessionBridge:
             self.post(root, L(f"本线程没有排队任务；全局队列 {total} 条。", f"no queued task on this thread; global queue has {total}."))
             return
         self.post(root, L("队列是空的。", "queue is empty."))
+
+    def _cfg_cmd(self, root, arg, kind):
+        """!model / !mode — switch session config through the real ACP
+        methods (session/set_config_option / session/set_mode). Slash
+        commands are not advertised by devin acp, so `!model x` sent as
+        session text only reaches the agent as a chat message — this
+        path sets it for real. Idle only: the request shares the acp's
+        single stdout with a running turn."""
+        s = self.sessions.get(root)
+        if not s:
+            self.post(root, L("本线程还没有会话。", "no session on this thread yet."))
+            return
+        if s.running or s.queued:
+            self.post(root, L("会话还在执行，等这轮结束（或 `!stop`）再切。",
+                              "session is still running — wait for this turn (or `!stop`) before switching."))
+            return
+        if not s.session_id:
+            self.post(root, L("会话还在启动，稍等再试。", "session still starting — try again shortly."))
+            return
+        if kind == "model":
+            cfg = (s.config_options or {}).get("model") or {}
+            opts, cur = dict(cfg.get("options") or {}), cfg.get("current")
+        else:
+            opts, cur = dict(s.mode_names or {}), s.mode_id
+        if not arg:
+            shown = opts.get(cur) or cur or L("未知", "unknown")
+            self.post(root, L(f"当前 {kind}：`{shown}`" +
+                              (f"（id `{cur}`）" if cur and opts.get(cur) and opts.get(cur) != cur else "") +
+                              f"。切换：`!{kind} <名字>`；列出：`!{kind} list`",
+                              f"current {kind}: `{shown}`" +
+                              (f" (id `{cur}`)" if cur and opts.get(cur) and opts.get(cur) != cur else "") +
+                              f". switch: `!{kind} <name>`; list: `!{kind} list`"))
+            return
+        a = arg.strip()
+        if a.lower() in ("list", "ls", "全部", "列表"):
+            if not opts:
+                self.post(root, L("可选清单还没同步到手边；仍可 `!" + kind + " <id>` 直接试。",
+                                  "option list not synced yet; you can still try `!" + kind + " <id>` directly."))
+                return
+            vals = sorted(opts.items())
+            plain = [(v, n) for v, n in vals if not v.startswith("fusion-")]
+            fusion = [(v, n) for v, n in vals if v.startswith("fusion-")]
+            head = L(f"可选 {kind}（`!{kind} <id>` 切换）：",
+                     f"available {kind} (`!{kind} <id>` to switch):")
+            rows = plain if kind == "model" else vals
+            msg = head + "\n" + "\n".join(f"`{v}` — {n or v}"
+                                          for v, n in rows[:25])
+            if len(rows) > 25:
+                msg += L(f"\n… 共 {len(rows)} 项", f"\n… {len(rows)} total")
+            if kind == "model" and fusion:
+                msg += L(f"\n\nFusion 搭配共 {len(fusion)} 种，节选：",
+                         f"\n\n{len(fusion)} fusion pairings, e.g.:")
+                msg += "\n" + "\n".join(f"`{v}`" for v, _ in fusion[:5])
+                msg += L("\n（Fusion 必须用完整 fusion-… id 切换）",
+                         "\n(fusion needs the full fusion-… id)")
+            self.post(root, msg)
+            return
+        pick = a if a in opts else None
+        if pick is None:
+            low = a.lower()
+            cand = [v for v, n in opts.items() if (n or "").lower() == low]
+            if not cand:
+                cand = [v for v, n in opts.items()
+                        if low in v.lower() or low in (n or "").lower()]
+            if len(cand) == 1:
+                pick = cand[0]
+            elif cand:
+                lst = "\n".join(f"`{c}` {opts.get(c) or ''}"
+                                for c in cand[:10])
+                self.post(root, L(f"匹配到 {len(cand)} 个，用完整 id 再发一次：\n{lst}",
+                                  f"{len(cand)} matches — resend with the exact id:\n{lst}"))
+                return
+            pick = a  # not in our list — let the server decide
+        try:
+            if kind == "model":
+                mid = s._request("session/set_config_option",
+                                 {"sessionId": s.session_id,
+                                  "configId": "model", "value": pick})
+            else:
+                mid = s._request("session/set_mode",
+                                 {"sessionId": s.session_id,
+                                  "modeId": pick})
+            res = s._wait_result(mid, time.monotonic() + 20,
+                                 lambda x: None, putback_foreign=True)
+        except Exception as e:
+            self.post(root, L(f"切换请求失败：{e}",
+                              f"switch request failed: {e}"))
+            return
+        if res is None:
+            self.post(root, L("已发出；另一请求占了响应通道，用 `!status` 确认。",
+                              "request sent; another response preempted the wait — check `!status`."))
+            return
+        if "error" in res:
+            self.post(root, L(f"被拒绝：{(res.get('error') or {}).get('message')}",
+                              f"rejected: {(res.get('error') or {}).get('message')}"))
+            return
+        s._note_session_meta(res.get("result") or {})
+        if kind == "mode":
+            s.mode_id = pick
+            s.mode_name = s.mode_names.get(pick) or pick
+        new = s.model_name if kind == "model" else s.mode_name
+        self.post(root, L(f"✅ 已切到 `{new or pick}`",
+                          f"✅ switched to `{new or pick}`"))
 
     def _reset(self, root):
         """Drop the session binding; the next in-thread reply starts a
@@ -4407,7 +4532,14 @@ class SessionBridge:
         """One transcript node → a phone-length 'what happened'
         line, e.g. L("跑 exec: docker ps", "ran exec: docker ps") or L("回: 已接管", "reply: adopted")."""
         role = m.get("role")
-        content = (m.get("content") or "").strip()
+        content = m.get("content")
+        if isinstance(content, list):
+            content = " ".join(str(p.get("text", ""))
+                               for p in content
+                               if isinstance(p, dict))
+        if not isinstance(content, str):
+            content = ""
+        content = content.strip()
         if role == "assistant":
             tcs = m.get("tool_calls") or []
             if tcs:

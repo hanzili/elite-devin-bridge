@@ -270,6 +270,21 @@ def main():
                       "result": {"sessionId": sid}})
         elif method == "session/set_mode":
             send({"jsonrpc": "2.0", "id": mid, "result": {}})
+        elif method == "session/set_config_option":
+            params = msg.get("params") or {}
+            val = params.get("value")
+            if val == "bad-value":
+                send({"jsonrpc": "2.0", "id": mid,
+                      "error": {"code": -32602,
+                                "message": "unknown option value"}})
+            else:
+                send({"jsonrpc": "2.0", "id": mid,
+                      "result": {"configOptions": [
+                          {"id": params.get("configId", "model"),
+                           "name": "Model", "type": "select",
+                           "currentValue": val,
+                           "options": [
+                               {"value": val, "name": val}]}]}})
         elif method == "session/prompt":
             if MODE == "die":
                 os._exit(3)

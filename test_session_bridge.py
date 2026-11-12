@@ -999,8 +999,8 @@ class BangCommandTest(unittest.TestCase):
     def test_bang_unknown_passthrough(self):
         b, web = make_bridge()
         self._session(b, web, "u.1")
-        b.handle_event(reply_ev("u.1", "u.2", "!mode plan"), "EvU2")
-        self.assertTrue(web.wait_for("执行指令:/mode plan"))
+        b.handle_event(reply_ev("u.1", "u.2", "!clear now"), "EvU2")
+        self.assertTrue(web.wait_for("执行指令:/clear now"))
         b.sessions["u.1"].terminate()
 
     def test_bang_goal_cancel(self):
